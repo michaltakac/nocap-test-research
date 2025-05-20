@@ -5,8 +5,11 @@ import math
 import glob
 from dataclasses import dataclass
 
+# Reduce VRAM usage by reducing fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np
 import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F

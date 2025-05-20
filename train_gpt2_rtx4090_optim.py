@@ -5,9 +5,13 @@ import math
 import glob
 from dataclasses import dataclass
 
+# Reduce VRAM usage by reducing fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np
 import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import nn
+torch.set_float32_matmul_precision('high')
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
@@ -29,23 +33,43 @@ class Rotary(torch.nn.Module):
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
+        self.dim = dim
 
     def forward(self, x):
         seq_len = x.shape[1]
+        head_dim = x.shape[-1]
+        # Ensure the rotary dimension matches the head_dim (half of it)
+        effective_dim = min(self.dim, head_dim // 2)
+        
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            # Use only as many frequency components as needed for the effective dimension
+            inv_freq_used = self.inv_freq[:effective_dim]
+            freqs = torch.outer(t, inv_freq_used).to(x.device)
             self.cos_cached = freqs.cos()
             self.sin_cached = freqs.sin()
+        
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
+    # Ensure cos and sin last dimension matches x
+    if cos.shape[-1] != d:
+        # Trim or pad cos/sin tensors to match x's dimensions
+        if cos.shape[-1] > d:
+            cos = cos[..., :d]
+            sin = sin[..., :d]
+        else:
+            # This shouldn't normally happen, but handle it anyway
+            pad_size = d - cos.shape[-1]
+            cos = torch.nn.functional.pad(cos, (0, pad_size))
+            sin = torch.nn.functional.pad(sin, (0, pad_size))
+    
     x1 = x[..., :d]
-    x2 = x[..., d:]
+    x2 = x[..., d:2*d]  # Only use the second half up to 2*d to match first half
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
@@ -61,36 +85,58 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_head = config.n_head
+        self.n_head_q = config.n_head
+        self.n_head_kv = config.n_kv_head if config.n_kv_head is not None else config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        
+        # Verify dimensions are compatible
+        assert self.n_embd % self.n_head_q == 0, f"n_embd ({self.n_embd}) must be divisible by n_head_q ({self.n_head_q})"
+        assert self.n_head_q % self.n_head_kv == 0, f"n_head_q ({self.n_head_q}) must be divisible by n_head_kv ({self.n_head_kv})"
+        
+        self.head_dim = self.n_embd // self.n_head_q
+        
+        # Separate projections for query and key/value
+        self.q_proj = nn.Linear(self.n_embd, self.n_head_q * self.head_dim, bias=False)
+        self.kv_proj = nn.Linear(self.n_embd, 2 * self.n_head_kv * self.head_dim, bias=False)
+        
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.rotary = Rotary(self.head_dim)
+        # Make sure rotary dimension is capped to head_dim
+        self.rotary = Rotary(min(self.head_dim, 64))
 
     def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        
+        # Project queries, keys, and values
+        q = self.q_proj(x).view(B, T, self.n_head_q, self.head_dim)
+        kv = self.kv_proj(x).view(B, T, self.n_head_kv, 2, self.head_dim)
+        k, v = kv.unbind(dim=3)  # shapes: (B, T, n_head_kv, head_dim)
+        
+        # Apply rotary embeddings
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
-        )
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-        # output projection
+        
+        # Expand k and v if we're using GQA (i.e., when n_head_q > n_head_kv)
+        if self.n_head_q > self.n_head_kv:
+            # Each q head maps to a specific kv head; we repeat each kv head to match
+            repeats = self.n_head_q // self.n_head_kv
+            k = k.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
+            v = v.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
+        
+        # Rearrange for scaled dot-product attention
+        # (B, T, H, D) -> (B, H, T, D)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        # Reshape back to (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # Output projection
         y = self.c_proj(y)
         return y
 
@@ -138,6 +184,11 @@ class GPTConfig:
     mtp_max_steps: int = 1 # If 1, only standard next-token. If >1, predicts 1..N and aux loss for 2..N
     mtp_weight: float = 0.1
     mtp_rampup_steps: int = 256 # Number of steps to linearly ramp up MTP weight from 0 to mtp_weight
+    # GQA parameters
+    gqa_enabled: bool = False
+    n_kv_head: int = None  # None defaults to n_head (i.e., MHSA); otherwise n_head > n_kv_head for GQA
+    # Precision parameter (not used in model; stored for config)
+    precision: str = "bf16"
 
 
 class GPT(nn.Module):
@@ -457,6 +508,38 @@ if __name__ == "__main__":
         default=256,
         help="Number of steps to linearly ramp up MTP weight from 0"
     )
+    # GQA arguments
+    parser.add_argument(
+        "--gqa_enabled",
+        action="store_true",
+        help="Enable Grouped-Query Attention (GQA)"
+    )
+    parser.add_argument(
+        "--n_kv_head",
+        type=int,
+        default=None,
+        help="Number of key/value heads for GQA (must be divisor of n_head)"
+    )
+    parser.add_argument(
+        "--kv_head_ratio",
+        type=float,
+        default=0.25,
+        help="Ratio of KV heads to query heads (e.g., 0.25 = 4x sharing, only used when n_kv_head is None)"
+    )
+    parser.add_argument(
+        "--embd_scale",
+        type=float,
+        default=1.12,
+        help="Scale factor for embedding dimension when using GQA (reinvests saved memory)"
+    )
+    # Add mixed precision argument
+    parser.add_argument(
+        "--precision", 
+        type=str,
+        choices=["fp32", "fp16", "bf16"], 
+        default="bf16",
+        help="Computation precision for forward/backward pass (fp32, fp16, bf16)"
+    )
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -494,8 +577,22 @@ if __name__ == "__main__":
     tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
 
+    # Decide mixed-precision mode
+    if args.precision == "fp16":
+        autocast_dtype = torch.float16
+        scaler = torch.cuda.amp.GradScaler()
+        print0("Using mixed precision: FP16 with gradient scaling")
+    elif args.precision == "bf16":
+        autocast_dtype = torch.bfloat16
+        scaler = None
+        print0("Using mixed precision: BF16 (no gradient scaling needed)")
+    else:  # fp32
+        autocast_dtype = torch.float32
+        scaler = None
+        print0("Using full precision: FP32")
+
     # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    ctx = torch.amp.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype!=torch.float32)
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size, args.mtp_enabled, args.mtp_max_steps)
@@ -520,13 +617,73 @@ if __name__ == "__main__":
         "d36": dict(n_layer=36, n_head=20, n_embd=1280),
         "d48": dict(n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
+    
+    print0(f"Initial model configuration: {model_config_params}")
+    
+    # Calculate n_kv_head based on ratio if not explicitly provided
+    n_kv_head = args.n_kv_head
+    if args.gqa_enabled and n_kv_head is None:
+        n_head = model_config_params["n_head"]
+        # Calculate target KV heads based on ratio, ensure at least 1
+        target_kv_heads = max(1, int(n_head * args.kv_head_ratio))
+        
+        # Find largest divisor of n_head that is <= target_kv_heads
+        n_kv_head = target_kv_heads
+        while n_head % n_kv_head != 0:
+            n_kv_head -= 1
+            # Safeguard against going below 1
+            if n_kv_head < 1:
+                n_kv_head = 1
+                break
+        
+        print0(f"Using n_kv_head={n_kv_head} (ratio={n_kv_head/n_head:.2f}) with n_head={n_head}")
+    
+    # Scale model size if GQA is enabled to reinvest memory savings
+    if args.gqa_enabled:
+        original_embd = model_config_params["n_embd"]
+        n_head = model_config_params["n_head"]
+        # Scale embedding dimension to reinvest memory savings
+        # Ensure the scaled dimension is divisible by n_head
+        scaled_embd = int(original_embd * args.embd_scale)
+        # Round to nearest multiple of n_head
+        model_config_params["n_embd"] = (scaled_embd // n_head) * n_head
+        print0(f"Scaling embedding dimension from {original_embd} to {model_config_params['n_embd']} with GQA enabled")
+    
+    # Verify final configuration
+    n_head = model_config_params["n_head"]
+    n_embd = model_config_params["n_embd"]
+    
+    if args.gqa_enabled:
+        # Verify the dimensions are compatible
+        if n_kv_head is not None and n_head % n_kv_head != 0:
+            print0(f"Warning: n_head ({n_head}) is not divisible by n_kv_head ({n_kv_head})")
+            # Find the largest divisor of n_head that is <= n_kv_head
+            new_n_kv_head = n_kv_head
+            while n_head % new_n_kv_head != 0 and new_n_kv_head > 1:
+                new_n_kv_head -= 1
+            print0(f"Adjusting n_kv_head from {n_kv_head} to {new_n_kv_head}")
+            n_kv_head = new_n_kv_head
+    
+    # Verify that embedding dimension is divisible by n_head
+    if n_embd % n_head != 0:
+        print0(f"Warning: n_embd ({n_embd}) is not divisible by n_head ({n_head})")
+        # Adjust embedding dimension to nearest multiple of n_head
+        n_embd = (n_embd // n_head) * n_head
+        model_config_params["n_embd"] = n_embd
+        print0(f"Adjusted n_embd to {n_embd}")
+    
+    print0(f"Final model configuration: {model_config_params}, n_kv_head={n_kv_head if args.gqa_enabled else n_head}")
+    
     model_config = GPTConfig(
         vocab_size=num_vocab, 
         **model_config_params,
         mtp_enabled=args.mtp_enabled,
         mtp_max_steps=args.mtp_max_steps if args.mtp_enabled else 1,
         mtp_weight=args.mtp_weight,
-        mtp_rampup_steps=args.mtp_rampup_steps
+        mtp_rampup_steps=args.mtp_rampup_steps,
+        gqa_enabled=args.gqa_enabled,
+        n_kv_head=n_kv_head if args.gqa_enabled else None,
+        precision=args.precision
     )
     model = GPT(model_config)
     model = model.train().cuda()
@@ -586,6 +743,10 @@ if __name__ == "__main__":
         # Calculate current MTP weight based on ramp-up schedule
         if args.mtp_enabled and step < args.mtp_rampup_steps:
             current_mtp_weight = (step / args.mtp_rampup_steps) * args.mtp_weight
+            # Update the config weight directly
+            raw_model.config.mtp_weight = current_mtp_weight
+        elif args.mtp_enabled:
+            current_mtp_weight = args.mtp_weight
             raw_model.config.mtp_weight = current_mtp_weight
 
         # once in a while evaluate the validation dataset
@@ -595,17 +756,17 @@ if __name__ == "__main__":
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loader.reset()  # reset the val loader so that it starts from the beginning
-            with torch.no_grad():
+            with torch.no_grad(), ctx:
                 val_loss = torch.zeros(1, device=device)
                 val_ntp_loss = torch.zeros(1, device=device)
                 val_mtp_loss = torch.zeros(1, device=device)
                 for _ in range(val_steps):  # always fixed number of validation steps
                     x_val, targets_dict_val = val_loader.next_batch()
                     # Get both main and auxiliary losses
-                    _, (main_loss, aux_loss) = model(x_val, targets_dict_val, return_logits=False, return_loss_components=True)
+                    logits, (main_loss, aux_loss) = model(x_val, targets_dict_val, return_logits=False, return_loss_components=True)
                     val_ntp_loss += main_loss.detach()
                     if aux_loss is not None:
-                        val_mtp_loss += (main_loss + raw_model.config.mtp_weight * aux_loss).detach()
+                        val_mtp_loss += (main_loss + aux_loss * current_mtp_weight).detach()
                     # For val_loss (the main metric), use only next-token prediction loss
                     val_loss += main_loss.detach()
                 
@@ -627,7 +788,8 @@ if __name__ == "__main__":
                         "val_loss": val_loss,  # Main metric - next-token only
                         "val_ntp_loss": val_ntp_loss,  # Same as val_loss, for clarity
                         "val_mtp_loss": val_mtp_loss if args.mtp_enabled else val_loss,  # Combined loss if MTP enabled
-                        "mtp_weight": raw_model.config.mtp_weight if args.mtp_enabled else 0.0,
+                        "mtp_weight": current_mtp_weight if args.mtp_enabled else 0.0,
+                        "peak_mem_MB": torch.cuda.max_memory_allocated() // (1024 * 1024),
                         "time": training_time_ms
                     }, step=step * tokens_per_iter)
                 if logfile is not None:
@@ -657,7 +819,12 @@ if __name__ == "__main__":
             )  # sync only on last micro step to avoid overhead
             # forward pass
             with ctx:
-                _, loss = model(x, targets_dict, return_logits=False)
+                logits, (main_loss, aux_loss) = model(x, targets_dict, return_logits=False, return_loss_components=True)
+                loss = main_loss
+                if aux_loss is not None:
+                    # Model already has the mtp_weight_buffer incorporated in the forward pass
+                    # But for gradient accumulation we need to build loss outside model
+                    loss = main_loss + aux_loss * current_mtp_weight
                 loss = (
                     loss / args.grad_accumulation_steps
                 )  # scale loss for gradient accumulation
@@ -665,7 +832,10 @@ if __name__ == "__main__":
             # advance the dataset for the next batch
             x, targets_dict = train_loader.next_batch()
             # backward pass
-            loss.backward()
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         train_loss /= (
             args.grad_accumulation_steps
@@ -675,8 +845,14 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        # step the optimizer
-        optimizer.step()
+        
+        # step the optimizer with scaler if needed
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+            
         optimizer.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
@@ -706,6 +882,21 @@ if __name__ == "__main__":
     )
 
     # -------------------------------------------------------------------------
+
+    peak_mem = torch.cuda.max_memory_allocated() // (1024 * 1024)
+    print0(f"Peak memory consumption: {peak_mem} MiB with precision={args.precision}")
+    
+    if args.gqa_enabled:
+        mem_details = {
+            "peak_memory_mb": peak_mem,
+            "n_head": model_config.n_head,
+            "n_kv_head": model_config.n_kv_head,
+            "n_embd": model_config.n_embd,
+            "n_layer": model_config.n_layer,
+            "kv_sharing_ratio": model_config.n_head / model_config.n_kv_head,
+            "embd_scale_factor": args.embd_scale
+        }
+        print0(f"GQA Configuration: {mem_details}")
 
     if master_process:
         log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)

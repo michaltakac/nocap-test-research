@@ -14,7 +14,11 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim.py \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
   --mtp_enabled \
-  --mtp_max_steps 3 \
-  --mtp_weight 0.1 \
+  --mtp_max_steps 2 \
+  --mtp_weight 0.2 \
   --mtp_rampup_steps 64 \
+  --gqa_enabled \
+  --kv_head_ratio 0.25 \
+  --embd_scale 1.12 \
+  --precision bf16 \
   --log_wandb

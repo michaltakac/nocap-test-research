@@ -113,3 +113,195 @@ This feature aims to improve training efficiency by encouraging the model to pre
 
 This plan implements MTP by reusing the final hidden states to predict multiple future tokens, which is computationally efficient. The dataloader is adjusted to provide the necessary future targets, with careful handling of data shard advancement and validation token counting to ensure correct operation in both single-process and distributed settings. The implementation includes weight ramp-up for stability and separate loss component tracking to monitor training progress.
 
+### 2. Memory-Optimized Attention (GQA/MLA)
+
+This feature implements Grouped-Query Attention (similar to Llama2's GQA and DeepSeek's Multi-head Latent Attention) to reduce memory usage and increase model capacity within the fixed 24GB VRAM of RTX 4090.
+
+**Goals:**
+- Reduce the activation memory footprint of attention by using fewer key/value heads than query heads
+- Use the saved memory to scale up model capacity (wider embeddings) to reach target loss faster
+- Maintain throughput while potentially improving training speed due to compute-memory balance
+
+**Implementation Plan:**
+
+1. **Command-line Interface Updates**
+   - Added flags to enable and configure GQA:
+     - `--gqa_enabled`: Boolean flag to enable GQA 
+     - `--n_kv_head`: Explicitly set number of KV heads (if not given, calculated from ratio)
+     - `--kv_head_ratio`: Ratio of KV heads to query heads (default 0.25, so 1/4 as many KV heads)
+     - `--embd_scale`: Factor to scale up embedding dimension with freed memory (default 1.12, or +12%)
+
+2. **GPTConfig Dataclass Extension**
+   - Added two key fields:
+     - `gqa_enabled: bool` - Whether to use GQA or standard multi-head attention
+     - `n_kv_head: int` - Number of key/value heads (None = same as n_head, i.e., standard attention)
+
+3. **CausalSelfAttention Refactoring**
+   - Complete rewrite of the attention module with separate Q and KV projections:
+     ```python
+     # Separate projections for query and key/value
+     self.q_proj = nn.Linear(self.n_embd, self.n_head_q * self.head_dim, bias=False)
+     self.kv_proj = nn.Linear(self.n_embd, 2 * self.n_head_kv * self.head_dim, bias=False)
+     ```
+   - Smart sharing of KV heads across multiple Q heads via `repeat_interleave`:
+     ```python
+     if self.n_head_q > self.n_head_kv:
+         repeats = self.n_head_q // self.n_head_kv
+         k = k.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
+         v = v.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
+     ```
+   - Validation of divisibility constraints:
+     ```python
+     assert self.n_embd % self.n_head_q == 0, "n_embd must be divisible by n_head_q"
+     assert self.n_head_q % self.n_head_kv == 0, "n_head_q must be divisible by n_head_kv"
+     ```
+
+4. **Dynamic KV Head Calculation**
+   - Supports ratio-based calculation when specific head count isn't given:
+     ```python
+     n_kv_head = max(1, int(n_head * args.kv_head_ratio))
+     # Ensure n_head is divisible by n_kv_head
+     while n_head % n_kv_head != 0:
+         n_kv_head -= 1
+     ```
+   - The divisibility enforcement ensures clean head-sharing patterns
+
+5. **Model Size Scaling**
+   - When GQA is enabled, we reinvest the saved memory by scaling up dimensions:
+     ```python
+     if args.gqa_enabled:
+         original_embd = model_config_params["n_embd"]
+         model_config_params["n_embd"] = int(original_embd * args.embd_scale)
+     ```
+   - Default scale of 1.12 = 12% wider embeddings with the same VRAM footprint
+
+6. **Memory Usage Monitoring**
+   - Added memory tracking to WandB logs:
+     ```python
+     "peak_mem_MB": torch.cuda.max_memory_allocated() // (1024 * 1024)
+     ```
+   - Memory validation report at the end of training:
+     ```python
+     mem_details = {
+         "peak_memory_mb": peak_mem,
+         "n_head": model_config.n_head,
+         "n_kv_head": model_config.n_kv_head,
+         "n_embd": model_config.n_embd,
+         "n_layer": model_config.n_layer,
+         "kv_sharing_ratio": model_config.n_head / model_config.n_kv_head,
+         "embd_scale_factor": args.embd_scale
+     }
+     ```
+
+7. **Run Script Update**
+   - `run.sh` updated with GQA parameters:
+     ```
+     --gqa_enabled \
+     --kv_head_ratio 0.25 \
+     --embd_scale 1.12 \
+     ```
+
+**Expected Benefits**
+
+1. **Memory Efficiency**: With a KV head ratio of 0.25 (typical), the KV cache size is reduced by ~75%, which accounts for a significant portion of the activation memory during training.
+
+2. **Reinvested Capacity**: The default configuration increases the embedding dimension by 12%, increasing model capacity without requiring more GPU memory.
+
+3. **Throughput Preservation**: While reducing activations, we avoid reduction in computational throughput by maintaining the same number of query heads, which are responsible for most of the interaction with token representations.
+
+4. **Loss Convergence**: Wider embeddings typically result in better representation capacity, which we expect to help reach the target validation loss (3.3821) faster than the baseline.
+
+The GQA implementation is based on research from Llama 2 and DeepSeek, which showed that many attention heads can share key/value projections without significant loss in model quality. Our implementation allows for flexible head-sharing ratios and automatic scaling of model capacity to efficiently utilize the fixed memory budget of a single RTX 4090.
+
+### 3. Mixed Precision Training
+
+This feature implements mixed precision training to leverage the tensor cores on modern NVIDIA GPUs (RTX 3090/4090), potentially doubling computational throughput with minimal impact on training quality.
+
+**Goals:**
+- Accelerate training by using tensor cores for matrix operations in lower precision
+- Support both BF16 (bfloat16) and FP16 (float16) precision modes
+- Keep memory usage efficient while ensuring training stability
+- Fix compilation issues with dynamic parameters (e.g., MTP weight ramp-up)
+
+**Implementation Plan:**
+
+1. **Command-line Interface Updates**
+   - Added a new precision selection flag:
+     ```
+     --precision [fp32|fp16|bf16]
+     ```
+   - Default is `bf16` (bfloat16), which provides the best balance of performance and stability on RTX 4090
+
+2. **GPTConfig Dataclass Extension**
+   - Added a field to track selected precision mode:
+     ```python
+     precision: str = "bf16"  # Options: "fp32", "fp16", "bf16"
+     ```
+
+3. **Automatic Precision and Scaler Configuration**
+   ```python
+   # Decide mixed-precision mode
+   if args.precision == "fp16":
+       autocast_dtype = torch.float16
+       scaler = torch.cuda.amp.GradScaler()  # necessary for FP16 stability
+   elif args.precision == "bf16":
+       autocast_dtype = torch.bfloat16
+       scaler = None  # BF16 doesn't need a scaler
+   else:  # fp32
+       autocast_dtype = torch.float32
+       scaler = None
+   ```
+
+4. **Training/Validation Context Management**
+   - Updated the autocast context to use the selected precision:
+     ```python
+     ctx = torch.amp.autocast(device_type="cuda", dtype=autocast_dtype, 
+                             enabled=autocast_dtype!=torch.float32)
+     ```
+   - Applied this context to both training and validation sections
+
+5. **Gradient Scaling for FP16**
+   - For FP16 precision, implemented gradient scaling to prevent underflow:
+     ```python
+     # Backward pass with scaling if needed
+     if scaler:
+         scaler.scale(loss).backward()
+     else:
+         loss.backward()
+         
+     # Optimizer step with unscaling if needed
+     if scaler:
+         scaler.step(optimizer)
+         scaler.update()
+     else:
+         optimizer.step()
+     ```
+
+6. **Torch.compile Compatibility Fix**
+   - Added a tensor buffer for the MTP weight to prevent recompilation issues:
+     ```python
+     # In GPT class __init__
+     self.register_buffer("mtp_weight_buffer", torch.tensor(config.mtp_weight, dtype=torch.float32))
+     
+     # In training loop
+     raw_model.mtp_weight_buffer.fill_(current_mtp_weight)
+     ```
+   - This avoids the recompilation warning that occurred when directly modifying `config.mtp_weight`
+   - Updated the forward pass to use this buffer instead of the config value, preventing graph recompilations during weight ramp-up
+
+7. **Performance Monitoring**
+   - Added precision tracking to logs and W&B:
+     ```python
+     print0(f"Peak memory consumption: {peak_mem} MiB with precision={args.precision}")
+     wandb.log({"peak_memory_mb": peak_mem, "precision": args.precision})
+     ```
+
+**Expected Benefits**
+
+1. **Training Speed**: Up to 2× faster matrix multiplications when using tensor cores with FP16/BF16
+2. **Memory Efficiency**: Lower precision formats require less memory for activations
+3. **Stable Training**: BF16 provides better numeric stability than FP16 while still being faster than FP32
+4. **Compatibility with torch.compile**: Fixed recompilation issues with dynamically changing parameters
+
+The mixed precision implementation is based on PyTorch's native AMP (Automatic Mixed Precision) system, providing a seamless way to leverage tensor cores on RTX GPUs. BF16 is set as the default because it offers the best balance between performance and stability for language models on RTX 4090, avoiding underflow issues while still benefiting from tensor core acceleration.
+
