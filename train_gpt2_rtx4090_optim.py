@@ -137,6 +137,7 @@ class GPTConfig:
     mtp_enabled: bool = False
     mtp_max_steps: int = 1 # If 1, only standard next-token. If >1, predicts 1..N and aux loss for 2..N
     mtp_weight: float = 0.1
+    mtp_rampup_steps: int = 256 # Number of steps to linearly ramp up MTP weight from 0 to mtp_weight
 
 
 class GPT(nn.Module):
@@ -156,7 +157,7 @@ class GPT(nn.Module):
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets_dict=None, return_logits=True):
+    def forward(self, idx, targets_dict=None, return_logits=True, return_loss_components=False):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
 
@@ -177,6 +178,7 @@ class GPT(nn.Module):
             total_loss = main_loss
 
             # Multi-Token Prediction (MTP) auxiliary loss
+            aux_loss = None
             if self.config.mtp_enabled and self.config.mtp_max_steps > 1 and self.config.mtp_weight > 0:
                 aux_loss_sum = torch.tensor(0.0, device=idx.device)
                 num_aux_losses = 0
@@ -193,9 +195,12 @@ class GPT(nn.Module):
                         num_aux_losses += 1
                 
                 if num_aux_losses > 0:
-                    avg_aux_loss = aux_loss_sum / num_aux_losses
-                    total_loss = main_loss + self.config.mtp_weight * avg_aux_loss
+                    aux_loss = aux_loss_sum / num_aux_losses
+                    total_loss = main_loss + self.config.mtp_weight * aux_loss
             loss = total_loss
+
+            if return_loss_components:
+                return logits, (main_loss, aux_loss) if aux_loss is not None else (main_loss, None)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(
@@ -446,6 +451,12 @@ if __name__ == "__main__":
         default=0.1,
         help="Weight for the MTP auxiliary loss"
     )
+    parser.add_argument(
+        "--mtp_rampup_steps",
+        type=int,
+        default=256,
+        help="Number of steps to linearly ramp up MTP weight from 0"
+    )
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -514,7 +525,8 @@ if __name__ == "__main__":
         **model_config_params,
         mtp_enabled=args.mtp_enabled,
         mtp_max_steps=args.mtp_max_steps if args.mtp_enabled else 1,
-        mtp_weight=args.mtp_weight
+        mtp_weight=args.mtp_weight,
+        mtp_rampup_steps=args.mtp_rampup_steps
     )
     model = GPT(model_config)
     model = model.train().cuda()
@@ -571,6 +583,11 @@ if __name__ == "__main__":
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
 
+        # Calculate current MTP weight based on ramp-up schedule
+        if args.mtp_enabled and step < args.mtp_rampup_steps:
+            current_mtp_weight = (step / args.mtp_rampup_steps) * args.mtp_weight
+            raw_model.config.mtp_weight = current_mtp_weight
+
         # once in a while evaluate the validation dataset
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             # stop the clock
@@ -579,22 +596,46 @@ if __name__ == "__main__":
             model.eval()
             val_loader.reset()  # reset the val loader so that it starts from the beginning
             with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(val_steps):  # always fiexed number of validation steps
+                val_loss = torch.zeros(1, device=device)
+                val_ntp_loss = torch.zeros(1, device=device)
+                val_mtp_loss = torch.zeros(1, device=device)
+                for _ in range(val_steps):  # always fixed number of validation steps
                     x_val, targets_dict_val = val_loader.next_batch()
-                    _, loss = model(x_val, targets_dict_val, return_logits=False)
-                    val_loss += loss
+                    # Get both main and auxiliary losses
+                    _, (main_loss, aux_loss) = model(x_val, targets_dict_val, return_logits=False, return_loss_components=True)
+                    val_ntp_loss += main_loss.detach()
+                    if aux_loss is not None:
+                        val_mtp_loss += (main_loss + raw_model.config.mtp_weight * aux_loss).detach()
+                    # For val_loss (the main metric), use only next-token prediction loss
+                    val_loss += main_loss.detach()
+                
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss /= val_steps
+                dist.all_reduce(val_ntp_loss, op=dist.ReduceOp.AVG)
+                if args.mtp_enabled:
+                    dist.all_reduce(val_mtp_loss, op=dist.ReduceOp.AVG)
+                
+                val_loss = val_loss.item() / val_steps
+                val_ntp_loss = val_ntp_loss.item() / val_steps
+                if args.mtp_enabled:
+                    val_mtp_loss = val_mtp_loss.item() / val_steps
+
             # log to console and to file
             print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
             if master_process:
                 if args.log_wandb:
-                    wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)
-                    wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
+                    wandb.log({
+                        "val_loss": val_loss,  # Main metric - next-token only
+                        "val_ntp_loss": val_ntp_loss,  # Same as val_loss, for clarity
+                        "val_mtp_loss": val_mtp_loss if args.mtp_enabled else val_loss,  # Combined loss if MTP enabled
+                        "mtp_weight": raw_model.config.mtp_weight if args.mtp_enabled else 0.0,
+                        "time": training_time_ms
+                    }, step=step * tokens_per_iter)
                 if logfile is not None:
                     with open(logfile, "a") as f:
-                        f.write("s:%d val:%f\n" % (step, val_loss))
+                        f.write("s:%d val:%f ntp:%f mtp:%f\n" % (
+                            step, val_loss, val_ntp_loss, 
+                            val_mtp_loss if args.mtp_enabled else val_loss
+                        ))
 
             # restart the clock
             torch.cuda.synchronize()
