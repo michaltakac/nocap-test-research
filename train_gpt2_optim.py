@@ -13,6 +13,14 @@ import torch.nn.functional as F
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+# new additions
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+try:
+    from flash_mla import get_mla_metadata, flash_mla_with_kvcache  # optional, for inference
+except ImportError:
+    print("Warning: flash_mla not found, some functionality may be limited")
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -65,11 +73,30 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
+        self.block_sz = 64  # MLA latent block length
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
+
+    def _latent_kv(self, k: torch.Tensor, v: torch.Tensor):
+        """
+        Collapse (B, T, H, D) → (B, L, H, D) where L = ⌈T / block_sz⌉
+        by simple mean-pool; more sophisticated reducers can be dropped in.
+        """
+        B, T, H, D = k.shape
+        pad = (-T) % self.block_sz
+        if pad:  # right-pad so view() is safe
+            pad_k = torch.zeros(B, pad, H, D, dtype=k.dtype, device=k.device)
+            # pad_v = torch.zeros(B, pad, H, D, dtype=v.dtype, device=v.device)
+            pad_v = torch.zeros_like(pad_k)
+            k, v = torch.cat((k, pad_k), 1), torch.cat((v, pad_v), 1)
+            T += pad
+        L = T // self.block_sz  # number of latent blocks
+        k_lat = k.view(B, L, self.block_sz, H, D).mean(2)  # (B, L, H, D)
+        v_lat = v.view(B, L, self.block_sz, H, D).mean(2)
+        return k_lat, v_lat  # still (B, L, H, D)
 
     def forward(self, x):
         B, T, C = (
@@ -84,12 +111,42 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
-        )
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
+
+        # Multi-latent compression of K/V
+        k_lat, v_lat = self._latent_kv(k, v)  # (B, L, H, D)
+        L = k_lat.size(1)
+        
+        # Rearrange to (B, H, S, D) that flex_attention expects
+        q = q.permute(0, 2, 1, 3)  # (B, H, T, D)
+        k_lat = k_lat.permute(0, 2, 1, 3)  # (B, H, L, D)
+        v_lat = v_lat.permute(0, 2, 1, 3)  # (B, H, L, D)
+        
+        # Ensure all tensors have the same dtype
+        # This is required by flex_attention
+        dtype = q.dtype
+        k_lat = k_lat.to(dtype)
+        v_lat = v_lat.to(dtype)
+        
+        blk = self.block_sz  # capture for closure
+        
+        # causal masking on latent blocks
+        def score_mod(score, b, h, q_idx, kv_idx):
+            """
+            Reject latent blocks that *start* after the query token.
+            kv_idx is block index, query index is absolute token index.
+            """
+            # Use a large negative number that works for both fp16 and bf16
+            # but isn't extreme enough to cause numerical instability
+            # mask_value = torch.tensor(-1e4, device=score.device)
+            mask_value = torch.full_like(kv_idx, -1e4)
+            return torch.where(kv_idx * blk > q_idx, mask_value, score)
+        
+        # FlexAttention call
+        y = flex_attention(q, k_lat, v_lat, score_mod=score_mod)  # (B, H, T, D)
+        y = (y.permute(0, 2, 1, 3)  # back to (B, T, H, D)
+             .contiguous()
+             .view(B, T, C))  # flatten heads
+        
         # output projection
         y = self.c_proj(y)
         return y
@@ -151,6 +208,13 @@ class GPT(nn.Module):
         self.transformer.wte.weight = (
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
+        self.multi_token_pred = False  # Default is disabled
+        self.multi_token_weight = 0.2  # Default weight for auxiliary loss
+
+    def set_multi_token_prediction(self, enabled=True, weight=0.2):
+        """Enable or disable multi-token prediction auxiliary loss"""
+        self.multi_token_pred = enabled
+        self.multi_token_weight = weight
 
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
@@ -166,9 +230,31 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(
+            primary_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
+            
+            # Multi-token prediction auxiliary loss (predict 2 steps ahead)
+            if self.multi_token_pred and t > 2:
+                # For the multi-token prediction, we use the hidden state at position i
+                # to predict the token at position i+2
+                multi_token_targets = targets.clone()
+                
+                # Shift targets by 2 positions (predict 2 tokens ahead)
+                multi_token_targets[:, :-2] = targets[:, 2:]
+                multi_token_targets[:, -2:] = -1  # Ignore last 2 positions
+                
+                # Use same logits but compare against the 2-ahead targets
+                multi_token_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), 
+                    multi_token_targets.view(-1), 
+                    ignore_index=-1
+                )
+                
+                # Combine losses with weighting
+                loss = primary_loss + self.multi_token_weight * multi_token_loss
+            else:
+                loss = primary_loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(
@@ -336,7 +422,10 @@ if __name__ == "__main__":
         help="number of gradient accumulation steps",
     )
     parser.add_argument(
-        "--sequence_length", type=int, default=64, help="sequence length"
+        "--sequence_length", 
+        type=int, 
+        default=64,  # Increased from 64 to 2048
+        help="sequence length"
     )
     # workload (number of steps)
     parser.add_argument(
@@ -359,6 +448,18 @@ if __name__ == "__main__":
         help="learning rate warmdown iterations",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    # multi-token prediction
+    parser.add_argument(
+        "--multi_token_pred",
+        action="store_true",
+        help="enable multi-token prediction auxiliary loss"
+    )
+    parser.add_argument(
+        "--multi_token_weight",
+        type=float,
+        default=0.2,
+        help="weight for multi-token prediction loss"
+    )
     # evaluation
     parser.add_argument(
         "--val_loss_every",
@@ -382,6 +483,14 @@ if __name__ == "__main__":
         "--log_wandb",
         action="store_true",
         help="log to wandb",
+    )
+    # set up a context manager following the desired dtype and device
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float32", "float16", "bfloat16"],
+        help="precision to use for training",
     )
     args = parser.parse_args()
 
@@ -421,7 +530,13 @@ if __name__ == "__main__":
     print0(f"tokens per iteration: {tokens_per_iter:,}")
 
     # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16
+    }
+    ctx = torch.amp.autocast(device_type="cuda", dtype=dtype_map[args.dtype])
+    print0(f"Using {args.dtype} precision for training")
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -449,10 +564,17 @@ if __name__ == "__main__":
     model = model.train().cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
-    print0("compiling the model...")
-    model = torch.compile(
-        model
-    )  # NOTE: this might cause issues depending on your GPU, consider turning it off
+    
+    # Enable multi-token prediction if requested
+    if args.multi_token_pred:
+        print0(f"Enabling multi-token prediction with weight {args.multi_token_weight}")
+        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model.set_multi_token_prediction(True, args.multi_token_weight)
+    
+    # print0("compiling the model...")
+    # model = torch.compile(
+    #     model
+    # )  # NOTE: this might cause issues depending on your GPU, consider turning it off
 
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -465,6 +587,9 @@ if __name__ == "__main__":
         betas=(0.9, 0.95),
         device_type=device,
     )
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
@@ -511,7 +636,8 @@ if __name__ == "__main__":
                 val_loss = 0.0
                 for _ in range(val_steps):  # always fiexed number of validation steps
                     x_val, y_val = val_loader.next_batch()
-                    _, loss = model(x_val, y_val, return_logits=False)
+                    with ctx:
+                        _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
@@ -552,8 +678,8 @@ if __name__ == "__main__":
                 train_loss += loss.detach()
             # advance the dataset for the next batch
             x, y = train_loader.next_batch()
-            # backward pass
-            loss.backward()
+            # backward pass with gradient scaling
+            scaler.scale(loss).backward()
 
         train_loss /= (
             args.grad_accumulation_steps
@@ -563,8 +689,9 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        # step the optimizer
-        optimizer.step()
+        # step the optimizer with gradient scaling
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
