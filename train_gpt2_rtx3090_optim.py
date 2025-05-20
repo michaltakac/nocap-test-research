@@ -523,7 +523,7 @@ if __name__ == "__main__":
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
         wandb.config.update(args)
-        wandb.save("train_gpt2.py")
+        wandb.save("train_gpt2_rtx3090_optim.py")
         wandb.save("run.sh")
 
     tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps

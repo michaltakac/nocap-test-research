@@ -1,4 +1,4 @@
-torchrun --standalone --nproc_per_node=1 train_gpt2_optim.py \
+torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir pylog124M \
@@ -13,7 +13,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_optim.py \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
-  --dtype float32 \
-  --multi_token_weight 0.2 \
-  --multi_token_pred \
-  --log_wandb
+  --mtp_enabled \
+  --mtp_max_steps 3 \
+  --mtp_weight 0.2
+  #--log_wandb
