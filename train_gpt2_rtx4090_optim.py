@@ -789,23 +789,29 @@ if __name__ == "__main__":
                     val_mtp_loss = val_mtp_loss.item() / val_steps
 
             # log to console and to file
-            print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
+            if args.mtp_enabled:
+                print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f} | mtp loss {val_mtp_loss:.6f}")
+            else:
+                print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
             if master_process:
                 if args.log_wandb:
-                    wandb.log({
-                        "val_loss": val_loss,  # Main metric - next-token only
-                        "val_ntp_loss": val_ntp_loss,  # Same as val_loss, for clarity
-                        "val_mtp_loss": val_mtp_loss if args.mtp_enabled else val_loss,  # Combined loss if MTP enabled
-                        "mtp_weight": current_mtp_weight if args.mtp_enabled else 0.0,
-                        "peak_mem_MB": torch.cuda.max_memory_allocated() // (1024 * 1024),
-                        "time": training_time_ms
-                    }, step=step * tokens_per_iter)
+                    wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)  # Main metric - next-token only
+                    if args.mtp_enabled:
+                        wandb.log({"val_ntp_loss": val_ntp_loss}, step=step * tokens_per_iter)  # Same as val_loss, for clarity
+                        wandb.log({"val_mtp_loss": val_mtp_loss}, step=step * tokens_per_iter)  # Combined loss if MTP enabled
+                        wandb.log({"mtp_weight": current_mtp_weight}, step=step * tokens_per_iter)  # MTP weight
+                    wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
                 if logfile is not None:
                     with open(logfile, "a") as f:
-                        f.write("s:%d val:%f ntp:%f mtp:%f\n" % (
-                            step, val_loss, val_ntp_loss, 
-                            val_mtp_loss if args.mtp_enabled else val_loss
-                        ))
+                        if args.mtp_enabled:
+                            f.write("s:%d val:%f ntp:%f mtp:%f\n" % (
+                                step, val_loss, val_ntp_loss, 
+                                val_mtp_loss
+                            ))
+                        else:
+                            f.write("s:%d val:%f\n" % (
+                                step, val_loss
+                            ))
 
             # restart the clock
             torch.cuda.synchronize()
