@@ -187,7 +187,7 @@ class GPTConfig:
     # GQA parameters
     gqa_enabled: bool = False
     n_kv_head: int = None  # None defaults to n_head (i.e., MHSA); otherwise n_head > n_kv_head for GQA
-    # Precision parameter (not used in model; stored for config)
+    # Precision parameter
     precision: str = "bf16"
 
 
@@ -208,7 +208,7 @@ class GPT(nn.Module):
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets_dict=None, return_logits=True, return_loss_components=False):
+    def forward(self, idx, targets_dict=None, return_logits=True, return_loss_components=False, mtp_weight=None):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
 
@@ -230,7 +230,8 @@ class GPT(nn.Module):
 
             # Multi-Token Prediction (MTP) auxiliary loss
             aux_loss = None
-            if self.config.mtp_enabled and self.config.mtp_max_steps > 1 and self.config.mtp_weight > 0:
+            effective_weight = mtp_weight if mtp_weight is not None else self.config.mtp_weight
+            if self.config.mtp_enabled and self.config.mtp_max_steps > 1 and effective_weight > 0:
                 aux_loss_sum = torch.tensor(0.0, device=idx.device)
                 num_aux_losses = 0
                 # Auxiliary losses for predictions from 2 steps ahead up to mtp_max_steps
@@ -247,7 +248,7 @@ class GPT(nn.Module):
                 
                 if num_aux_losses > 0:
                     aux_loss = aux_loss_sum / num_aux_losses
-                    total_loss = main_loss + self.config.mtp_weight * aux_loss
+                    total_loss = main_loss + effective_weight * aux_loss
             loss = total_loss
 
             if return_loss_components:
@@ -685,7 +686,17 @@ if __name__ == "__main__":
         n_kv_head=n_kv_head if args.gqa_enabled else None,
         precision=args.precision
     )
-    model = GPT(model_config)
+    # decide parameter / activation dtype
+    dtype = (
+        torch.bfloat16 if args.precision == "bf16"
+        else torch.float32 if args.precision == "fp32"
+        else torch.float16
+    )
+    # enable Flash-Attention v2 & memory-efficient SDPA kernels ----
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    model = GPT(model_config).to(device, dtype=dtype)
     model = model.train().cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
@@ -743,11 +754,8 @@ if __name__ == "__main__":
         # Calculate current MTP weight based on ramp-up schedule
         if args.mtp_enabled and step < args.mtp_rampup_steps:
             current_mtp_weight = (step / args.mtp_rampup_steps) * args.mtp_weight
-            # Update the config weight directly
-            raw_model.config.mtp_weight = current_mtp_weight
         elif args.mtp_enabled:
             current_mtp_weight = args.mtp_weight
-            raw_model.config.mtp_weight = current_mtp_weight
 
         # once in a while evaluate the validation dataset
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
