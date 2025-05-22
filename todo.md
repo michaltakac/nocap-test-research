@@ -1,0 +1,1 @@
+- [ ] try mtp_max_steps = 2, mtp_rampup_steps = 256 and mtp_weight = 0.2

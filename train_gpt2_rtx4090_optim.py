@@ -12,6 +12,8 @@ import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import nn
 torch.set_float32_matmul_precision('high')
+# For BF16 performance
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
@@ -117,26 +119,20 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         
-        # Expand k and v if we're using GQA (i.e., when n_head_q > n_head_kv)
-        if self.n_head_q > self.n_head_kv:
-            # Each q head maps to a specific kv head; we repeat each kv head to match
-            repeats = self.n_head_q // self.n_head_kv
-            k = k.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
-            v = v.repeat_interleave(repeats, dim=2)  # (B, T, n_head_q, head_dim)
+        # Rearrange and process attention.
+        if self.n_head_q != self.n_head_kv:
+            repeats = self.n_head_q // self.n_head_kv  # e.g. 4 for 12/3
+            k = k.repeat_interleave(repeats, dim=2)
+            v = v.repeat_interleave(repeats, dim=2)
+
+        # Standard attention path with heads now matching
+        q_t = q.transpose(1,2)
+        k_t = k.transpose(1,2)
+        v_t = v.transpose(1,2)
+        y = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+        y = y.transpose(1,2).contiguous().view(B, T, C)
         
-        # Rearrange for scaled dot-product attention
-        # (B, T, H, D) -> (B, H, T, D)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # Compute attention
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        
-        # Reshape back to (B, T, C)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        
-        # Output projection
+        # output projection
         y = self.c_proj(y)
         return y
 
@@ -207,8 +203,10 @@ class GPT(nn.Module):
         self.transformer.wte.weight = (
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
+        # For torch.compile compatibility with dynamic MTP weight
+        self.register_buffer("mtp_weight_buffer", torch.tensor(config.mtp_weight, dtype=torch.float32))
 
-    def forward(self, idx, targets_dict=None, return_logits=True, return_loss_components=False, mtp_weight=None):
+    def forward(self, idx, targets_dict=None, return_logits=True, return_loss_components=False):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
 
@@ -230,9 +228,10 @@ class GPT(nn.Module):
 
             # Multi-Token Prediction (MTP) auxiliary loss
             aux_loss = None
-            effective_weight = mtp_weight if mtp_weight is not None else self.config.mtp_weight
-            if self.config.mtp_enabled and self.config.mtp_max_steps > 1 and effective_weight > 0:
-                aux_loss_sum = torch.tensor(0.0, device=idx.device)
+            # Use the mtp_weight_buffer for compile-time stability
+            effective_weight = self.mtp_weight_buffer
+            if self.config.mtp_enabled and self.config.mtp_max_steps > 1:
+                aux_loss_sum = torch.tensor(0.0, device=idx.device, dtype=x.dtype) # Match dtype
                 num_aux_losses = 0
                 # Auxiliary losses for predictions from 2 steps ahead up to mtp_max_steps
                 for k in range(2, self.config.mtp_max_steps + 1):
@@ -644,11 +643,19 @@ if __name__ == "__main__":
         original_embd = model_config_params["n_embd"]
         n_head = model_config_params["n_head"]
         # Scale embedding dimension to reinvest memory savings
-        # Ensure the scaled dimension is divisible by n_head
         scaled_embd = int(original_embd * args.embd_scale)
-        # Round to nearest multiple of n_head
-        model_config_params["n_embd"] = (scaled_embd // n_head) * n_head
-        print0(f"Scaling embedding dimension from {original_embd} to {model_config_params['n_embd']} with GQA enabled")
+        # Ensure head_dim stays <=64 and div by 8
+        candidate_embd = (scaled_embd // n_head) * n_head
+        head_dim_candidate = candidate_embd // n_head
+        if head_dim_candidate > 64:
+            candidate_embd = 64 * n_head  # cap head_dim at 64
+            head_dim_candidate = 64
+        # round head_dim_candidate to multiple of 8 if needed
+        if head_dim_candidate % 8 != 0:
+            head_dim_candidate = (head_dim_candidate // 8) * 8
+            candidate_embd = head_dim_candidate * n_head
+        model_config_params["n_embd"] = int(candidate_embd)
+        print0(f"Scaling embedding dimension from {original_embd} to {model_config_params['n_embd']} with GQA enabled (head_dim={head_dim_candidate})")
     
     # Verify final configuration
     n_head = model_config_params["n_head"]
@@ -754,8 +761,10 @@ if __name__ == "__main__":
         # Calculate current MTP weight based on ramp-up schedule
         if args.mtp_enabled and step < args.mtp_rampup_steps:
             current_mtp_weight = (step / args.mtp_rampup_steps) * args.mtp_weight
+            raw_model.mtp_weight_buffer.fill_(current_mtp_weight) # Update buffer
         elif args.mtp_enabled:
             current_mtp_weight = args.mtp_weight
+            raw_model.mtp_weight_buffer.fill_(current_mtp_weight) # Ensure buffer has final weight
 
         # once in a while evaluate the validation dataset
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
@@ -764,7 +773,7 @@ if __name__ == "__main__":
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loader.reset()  # reset the val loader so that it starts from the beginning
-            with torch.no_grad(), ctx:
+            with torch.no_grad():
                 val_loss = torch.zeros(1, device=device)
                 val_ntp_loss = torch.zeros(1, device=device)
                 val_mtp_loss = torch.zeros(1, device=device)
@@ -774,7 +783,7 @@ if __name__ == "__main__":
                     logits, (main_loss, aux_loss) = model(x_val, targets_dict_val, return_logits=False, return_loss_components=True)
                     val_ntp_loss += main_loss.detach()
                     if aux_loss is not None:
-                        val_mtp_loss += (main_loss + aux_loss * current_mtp_weight).detach()
+                        val_mtp_loss += (main_loss + aux_loss * raw_model.mtp_weight_buffer).detach()
                     # For val_loss (the main metric), use only next-token prediction loss
                     val_loss += main_loss.detach()
                 
@@ -799,7 +808,6 @@ if __name__ == "__main__":
                     if args.mtp_enabled:
                         wandb.log({"val_ntp_loss": val_ntp_loss}, step=step * tokens_per_iter)  # Same as val_loss, for clarity
                         wandb.log({"val_mtp_loss": val_mtp_loss}, step=step * tokens_per_iter)  # Combined loss if MTP enabled
-                        wandb.log({"mtp_weight": current_mtp_weight}, step=step * tokens_per_iter)  # MTP weight
                     wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
                 if logfile is not None:
                     with open(logfile, "a") as f:
@@ -836,9 +844,8 @@ if __name__ == "__main__":
                 logits, (main_loss, aux_loss) = model(x, targets_dict, return_logits=False, return_loss_components=True)
                 loss = main_loss
                 if aux_loss is not None:
-                    # Model already has the mtp_weight_buffer incorporated in the forward pass
-                    # But for gradient accumulation we need to build loss outside model
-                    loss = main_loss + aux_loss * current_mtp_weight
+                    # Training loss uses the current_mtp_weight by referencing the buffer
+                    loss = main_loss + aux_loss * raw_model.mtp_weight_buffer
                 loss = (
                     loss / args.grad_accumulation_steps
                 )  # scale loss for gradient accumulation
