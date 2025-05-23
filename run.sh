@@ -13,6 +13,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim.py \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
+  --target_val_loss 3.3821 \
   --mtp_enabled \
   --mtp_max_steps 2 \
   --mtp_weight 0.1 \

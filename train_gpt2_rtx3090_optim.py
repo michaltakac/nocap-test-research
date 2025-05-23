@@ -495,6 +495,12 @@ if __name__ == "__main__":
         choices=["float32", "float16", "bfloat16"],
         help="precision to use for training",
     )
+    parser.add_argument(
+        "--target_val_loss",
+        type=float,
+        default=3.3821,
+        help="Target validation loss to stop training."
+    )
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -653,6 +659,11 @@ if __name__ == "__main__":
                 if logfile is not None:
                     with open(logfile, "a") as f:
                         f.write("s:%d val:%f\n" % (step, val_loss))
+
+            # Check for early stopping based on target validation loss
+            if val_loss <= args.target_val_loss:
+                print0(f"Target validation loss {args.target_val_loss} reached at step {step}. Stopping training after {training_time_ms/1000:.2f} seconds ({training_time_ms/3600000:.2f} hours).")
+                last_step = True # This will break the main loop after this block
 
             # restart the clock
             torch.cuda.synchronize()
