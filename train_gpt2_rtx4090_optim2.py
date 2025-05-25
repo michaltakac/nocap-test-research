@@ -131,6 +131,148 @@ class Block(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Frequency counting and negative sampling utilities
+
+def count_token_frequencies(filename_pattern, vocab_size):
+    """Count token frequencies across all data shards for negative sampling."""
+    files = sorted(glob.glob(filename_pattern))
+    freqs = np.zeros(vocab_size, dtype=np.int64)
+    
+    print0(f"Counting token frequencies across {len(files)} files...")
+    for fname in files:
+        tokens = _load_data_shard(fname)
+        # Use numpy bincount for efficient counting
+        shard_freqs = np.bincount(tokens, minlength=vocab_size)
+        freqs[:len(shard_freqs)] += shard_freqs
+    
+    print0(f"Token frequency counting complete. Total tokens: {freqs.sum():,}")
+    return freqs
+
+
+def build_alias_table(probs, table_size):
+    """Build alias table for O(1) sampling using Walker's alias method."""
+    n = len(probs)
+    # For simplicity, make table_size = n and just use the probabilities directly
+    table_size = n
+    
+    # Normalize probabilities
+    probs = np.array(probs, dtype=np.float64)
+    probs = probs / probs.sum()
+    
+    # Scale to table size
+    scaled = probs * table_size
+    
+    alias = np.zeros(table_size, dtype=np.int32)
+    prob = np.zeros(table_size, dtype=np.float32)
+    
+    # Separate indices into small and large based on scaled probabilities
+    small = []
+    large = []
+    
+    for i, p in enumerate(scaled):
+        if p < 1.0:
+            small.append(i)
+        else:
+            large.append(i)
+    
+    # Build the alias table
+    for i in range(table_size):
+        prob[i] = scaled[i]
+        alias[i] = i
+        
+        if scaled[i] < 1.0 and len(large) > 0:
+            # Pair this small probability with a large one
+            j = large[0]
+            alias[i] = j
+            scaled[j] -= (1.0 - scaled[i])
+            
+            # Update large/small categorization
+            if scaled[j] < 1.0:
+                large.pop(0)
+                small.append(j)
+    
+    return alias, prob
+
+
+class UnigramSampler:
+    """Efficient unigram sampler using alias method."""
+    
+    def __init__(self, freqs, power=0.75, table_size=1_000_000, device='cuda'):
+        self.device = device
+        self.vocab_size = len(freqs)
+        self.power = power  # Store power for annealing
+        
+        # Convert frequencies to probabilities with power scaling
+        probs = np.power(freqs + 1e-10, power)  # Add small epsilon to avoid zeros
+        probs = probs / probs.sum()
+        
+        # Build alias table and move to GPU
+        alias, prob = build_alias_table(probs, self.vocab_size)
+        self.alias_table = torch.from_numpy(alias).to(device)
+        self.prob_table = torch.from_numpy(prob).to(device)
+        
+        print0(f"Built unigram sampler with vocab size {self.vocab_size:,}")
+    
+    def sample(self, n):
+        """Sample n tokens using the alias table."""
+        # Generate random indices and probabilities
+        indices = torch.randint(0, self.vocab_size, (n,), device=self.device)
+        uniform = torch.rand(n, device=self.device)
+        
+        # Use alias table for sampling
+        use_primary = uniform < self.prob_table[indices]
+        primary_samples = indices
+        alias_samples = self.alias_table[indices]
+        
+        return torch.where(use_primary, primary_samples, alias_samples)
+
+
+class NegSamplingLoss(nn.Module):
+    """Negative Sampling Loss module implementing NCE for language modeling."""
+    
+    def __init__(self, weight, k, sampler, shared_batch=False):
+        super().__init__()
+        self.k = k
+        self.sampler = sampler
+        self.shared = shared_batch
+        # Register weight as buffer to avoid it being treated as a parameter
+        self.register_buffer('weight', weight)
+    
+    def forward(self, h, target):
+        """
+        Compute negative sampling loss.
+        
+        Args:
+            h: Hidden states (B*T, d)
+            target: Target tokens (B*T,)
+        """
+        batch_size = h.shape[0]
+        
+        if self.shared:
+            # Sample k negatives shared across the batch
+            neg = self.sampler.sample(self.k)  # (k,)
+            neg = neg.unsqueeze(0).expand(batch_size, self.k)  # (B*T, k)
+        else:
+            # Sample k negatives per token
+            neg = self.sampler.sample(batch_size * self.k).view(batch_size, self.k)
+        
+        # Get embeddings for positive and negative samples
+        w_pos = self.weight[target]  # (B*T, d)
+        w_neg = self.weight[neg]     # (B*T, k, d)
+        
+        # Compute scores
+        noise_logprob = torch.log(self.sampler.prob_table)   # on device
+        pos_corr = noise_logprob[target] + math.log(self.k)
+        neg_corr = noise_logprob[neg]                        # (B*T,k)
+
+        s_pos = (h * w_pos).sum(-1) - pos_corr
+        s_neg = torch.einsum('bd,bkd->bk', h, w_neg) - neg_corr
+
+        loss = -F.logsigmoid(s_pos).mean() - F.logsigmoid(-s_neg).mean()
+        return loss
+
+
+# -----------------------------------------------------------------------------
 # The main GPT-2 model
 
 
@@ -144,10 +286,12 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config, use_asoft=False, cutoffs=None, div_value=4.0):
+    def __init__(self, config, use_asoft=False, cutoffs=None, div_value=4.0, 
+                 use_neg_sampling=False, ns_k=20, sampler=None, shared_neg=False):
         super().__init__()
         self.config = config
         self.use_asoft = use_asoft
+        self.use_neg_sampling = use_neg_sampling
 
         self.transformer = nn.ModuleDict(
             dict(
@@ -155,7 +299,18 @@ class GPT(nn.Module):
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             )
         )
-        if use_asoft:
+        
+        if use_neg_sampling:
+            assert sampler is not None, "sampler must be provided for negative sampling"
+            # For negative sampling, we only need the weight matrix, no bias
+            self.lm_head = nn.Parameter(torch.randn(config.vocab_size, config.n_embd))
+            # Initialize with small random values
+            nn.init.normal_(self.lm_head, mean=0.0, std=0.02)
+            # Set up negative sampling loss
+            self.neg_loss = NegSamplingLoss(self.lm_head, ns_k, sampler, shared_neg)
+            # Weight tying with embedding
+            self.transformer.wte.weight = self.lm_head
+        elif use_asoft:
             assert cutoffs is not None, "cutoffs must be provided for adaptive softmax"
             self.asoft = AdaptiveLogSoftmaxWithLoss(
                 in_features=config.n_embd,
@@ -181,7 +336,21 @@ class GPT(nn.Module):
             x = block(x)
         x = rmsnorm(x)
 
-        if self.use_asoft:
+        if self.use_neg_sampling:
+            if targets is not None:
+                # training/validation path
+                h = x.view(-1, x.size(-1))  # (B*T, d)
+                targets_flat = targets.view(-1)  # (B*T,)
+                loss = self.neg_loss(h, targets_flat)
+                # For negative sampling, we don't typically return logits during training
+                # as they're not needed and would be expensive to compute
+                logits = None
+            else:
+                # inference-time: fallback to full softmax on the very last position
+                # This is rare and only used for generation
+                logits = F.linear(x[:, [-1], :], self.lm_head)  # (B, 1, V)
+                loss = None
+        elif self.use_asoft:
             original_x_dtype = x.dtype # Store original dtype, e.g., bfloat16
             x_for_asoft = x.to(torch.float32) # Cast input to asoft to float32
 
@@ -222,7 +391,7 @@ class GPT(nn.Module):
                 loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits and not self.use_asoft: # asoft handles its own logit return
+        if not return_logits and not self.use_asoft and not self.use_neg_sampling:
             logits = None
 
         return logits, loss
@@ -326,6 +495,26 @@ class DistributedDataLoader:
 # int main
 
 VAL_TOKENS = 1_048_576  # how many tokens of validation data. It's important to keep this fixed for consistent comparisons
+
+
+def compute_full_cross_entropy_loss(model, x_val, y_val):
+    """
+    Compute full cross-entropy loss for negative sampling models during validation.
+    This is needed to get the proper benchmark metric.
+    """
+    # Forward through transformer layers
+    b, t = x_val.size()
+    x = model.module.transformer.wte(x_val)
+    for block in model.module.transformer.h:
+        x = block(x)
+    x = rmsnorm(x)
+    
+    # Compute full softmax using the weight matrix
+    logits = F.linear(x, model.module.lm_head)  # (B, T, V)
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), y_val.view(-1), ignore_index=-1
+    )
+    return loss
 
 
 def print0(*args, **kwargs):
@@ -459,11 +648,65 @@ if __name__ == "__main__":
         default=3.3821,
         help="Target validation loss to stop training."
     )
+    # Negative Sampling arguments
+    parser.add_argument(
+        "--negative_sampling",
+        action="store_true",
+        help="Use Negative Sampling / NCE instead of a full softmax layer."
+    )
+    parser.add_argument(
+        "--ns_k",
+        type=int,
+        default=20,
+        help="Number of negative samples per positive sample for negative sampling."
+    )
+    parser.add_argument(
+        "--ns_power",
+        type=float,
+        default=0.75,
+        help="Exponent for the unigram distribution in negative sampling (0.75 is Mikolov's default)."
+    )
+    parser.add_argument(
+        "--ns_shared_negatives",
+        action="store_true",
+        help="If set, sample k negatives per batch instead of per token."
+    )
+    parser.add_argument(
+        "--ns_table_size",
+        type=int,
+        default=1_000_000,
+        help="Size of pre-built alias table for negative sampling."
+    )
+    parser.add_argument(
+        "--ns_k_schedule",
+        type=str,
+        default="20",
+        help="Comma-separated k values for annealing (e.g., '24,12,8'). Single value means no annealing."
+    )
+    parser.add_argument(
+        "--ns_power_schedule",
+        type=str,
+        default="0.75",
+        help="Comma-separated power values for annealing (e.g., '0.75,0.6,0.5'). Single value means no annealing."
+    )
+    parser.add_argument(
+        "--val_sequence_length",
+        type=int,
+        default=None,
+        help="Sequence length used for validation. If None, defaults to --sequence_length." 
+    )
     args = parser.parse_args()
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert args.model in {"d12", "d24", "d36", "d48"}
+    
+    # Mutual exclusion between adaptive softmax and negative sampling
+    if args.adaptive_softmax and args.negative_sampling:
+        print0("ERROR: Cannot use both --adaptive_softmax and --negative_sampling simultaneously.")
+        print0("Please choose one output layer type.")
+        exit(1)
+    
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
@@ -515,13 +758,18 @@ if __name__ == "__main__":
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    tokens_per_iter_val = args.val_batch_size * T * ddp_world_size
-    assert VAL_TOKENS % tokens_per_iter_val == 0
+    
+    # Validation sequence length can differ
+    T_val = args.val_sequence_length if args.val_sequence_length is not None else T
+    
+    tokens_per_iter_val = args.val_batch_size * T_val * ddp_world_size
+    assert VAL_TOKENS % tokens_per_iter_val == 0, (
+        f"VAL_TOKENS ({VAL_TOKENS}) must be divisible by val_batch_size*val_sequence_length*world_size "
+        f"({tokens_per_iter_val}). Choose different --val_sequence_length or --val_batch_size.")
     val_steps = VAL_TOKENS // tokens_per_iter_val
-
+    
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
+        args.input_val_bin, args.val_batch_size, T_val, ddp_rank, ddp_world_size
     )
     x, y = train_loader.next_batch()
 
@@ -533,6 +781,78 @@ if __name__ == "__main__":
     # Let's ensure consistency.
     effective_vocab_size = num_vocab
     print0(f"Effective vocabulary size: {effective_vocab_size}")
+
+    # Set up negative sampling if enabled
+    sampler = None
+    k_schedule = []
+    power_schedule = []
+    k_transition_steps = []
+    freqs = None
+    if args.negative_sampling:
+        print0(f"Setting up negative sampling with k={args.ns_k}, power={args.ns_power}")
+        
+        # Parse k and power schedules for annealing
+        k_schedule = [int(k.strip()) for k in args.ns_k_schedule.split(',')]
+        power_schedule = [float(p.strip()) for p in args.ns_power_schedule.split(',')]
+        
+        # Validate schedules
+        if len(k_schedule) != len(power_schedule):
+            print0("ERROR: ns_k_schedule and ns_power_schedule must have the same number of values")
+            exit(1)
+        
+        # Validate edge case: short training with 3-value schedule
+        if len(k_schedule) == 3 and args.num_iterations < 4:
+            print0(f"WARNING: Using 3-value schedule with only {args.num_iterations} iterations may cause transition steps to overlap.")
+            print0("Consider using a 2-value schedule or increasing num_iterations.")
+            
+        # Set initial values and create annealing schedule
+        initial_k = k_schedule[0]
+        initial_power = power_schedule[0]
+        
+        if len(k_schedule) > 1:
+            # Calculate transition points (evenly spaced)
+            total_steps = args.num_iterations
+            if len(k_schedule) == 3:
+                # For 3 values: first 25% use k[0], next 50% use k[1], final 25% use k[2]
+                k_transition_steps = [max(1, int(0.25 * total_steps)), max(2, int(0.75 * total_steps))]
+            elif len(k_schedule) == 2:
+                # For 2 values: first 50% use k[0], second 50% use k[1]
+                k_transition_steps = [max(1, int(0.5 * total_steps))]
+            else:
+                # For other cases, evenly distribute
+                step_size = total_steps // len(k_schedule)
+                k_transition_steps = [max(i + 1, (i + 1) * step_size) for i in range(len(k_schedule) - 1)]
+            
+            print0(f"K annealing schedule: {k_schedule} at steps {[0] + k_transition_steps}")
+            print0(f"Power annealing schedule: {power_schedule} at steps {[0] + k_transition_steps}")
+        else:
+            k_transition_steps = []
+            print0(f"No annealing - using fixed k={initial_k}, power={initial_power}")
+        
+        print0(f"Setting up negative sampling with initial k={initial_k}, power={initial_power}")
+        
+        # Check if frequency file exists to avoid recomputing
+        freq_file = f"data/fineweb10B/token_freqs_vocab{effective_vocab_size}.npy"
+        if os.path.exists(freq_file) and master_process:
+            print0(f"Loading cached token frequencies from {freq_file}")
+            freqs = np.load(freq_file)
+        else:
+            if master_process:
+                # Only master process counts frequencies to avoid conflicts
+                freqs = count_token_frequencies(args.input_bin, effective_vocab_size)
+                # Save frequencies for future runs
+                os.makedirs(os.path.dirname(freq_file), exist_ok=True)
+                np.save(freq_file, freqs)
+                print0(f"Saved token frequencies to {freq_file}")
+            else:
+                # Wait for master process to finish and load the file
+                while not os.path.exists(freq_file):
+                    time.sleep(1)
+                freqs = np.load(freq_file)
+        
+        # Create unigram sampler on all processes
+        sampler = UnigramSampler(freqs, power=initial_power, 
+                               table_size=args.ns_table_size, device=device)
 
     model_config = {
         "d12": GPTConfig(
@@ -553,8 +873,11 @@ if __name__ == "__main__":
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
+    # Set up output layer configuration
     use_asoft = args.adaptive_softmax
+    use_neg_sampling = args.negative_sampling
     asoft_cutoffs_parsed = []
+    
     if use_asoft:
         if args.asoft_cutoffs.strip():
             asoft_cutoffs_parsed = [int(c.strip()) for c in args.asoft_cutoffs.split(',')]
@@ -567,9 +890,14 @@ if __name__ == "__main__":
              use_asoft = False # Fallback to default softmax
         else:
             print0(f"Using Adaptive Softmax with cutoffs: {asoft_cutoffs_parsed} and div_value: {args.asoft_div_value}")
+    
+    if use_neg_sampling:
+        print0(f"Using Negative Sampling with initial k={initial_k}, shared_negatives={args.ns_shared_negatives}")
 
-
-    model = GPT(model_config, use_asoft=use_asoft, cutoffs=asoft_cutoffs_parsed, div_value=args.asoft_div_value)
+    model = GPT(model_config, 
+                use_asoft=use_asoft, cutoffs=asoft_cutoffs_parsed, div_value=args.asoft_div_value,
+                use_neg_sampling=use_neg_sampling, ns_k=initial_k, 
+                sampler=sampler, shared_neg=args.ns_shared_negatives)
     # Move to device first, then cast dtypes
     model.to(device)
     
@@ -634,6 +962,40 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    def _maybe_anneal_negative_sampling(step, args, k_schedule, power_schedule, k_transition_steps, 
+                                       raw_model, sampler, freqs, device):
+        """Apply k and power annealing for negative sampling if conditions are met."""
+        if not args.negative_sampling or len(k_schedule) <= 1:
+            return sampler
+            
+        # Determine current schedule index
+        current_schedule_idx = 0
+        for i, transition_step in enumerate(k_transition_steps):
+            if step >= transition_step:
+                current_schedule_idx = i + 1
+        
+        # Check if we need to update k or power
+        target_k = k_schedule[current_schedule_idx]
+        target_power = power_schedule[current_schedule_idx]
+        
+        # Update k if it changed
+        if hasattr(raw_model, 'neg_loss') and raw_model.neg_loss.k != target_k:
+            old_k = raw_model.neg_loss.k
+            raw_model.neg_loss.k = target_k
+            print0(f"Step {step}: Annealing k from {old_k} to {target_k}")
+        
+        # Update power if it changed (rebuild sampler)
+        if sampler is not None and abs(sampler.power - target_power) > 1e-6:
+            old_power = sampler.power
+            # Rebuild sampler with new power
+            new_sampler = UnigramSampler(freqs, power=target_power, 
+                                       table_size=args.ns_table_size, device=device)
+            raw_model.neg_loss.sampler = new_sampler
+            print0(f"Step {step}: Annealing power from {old_power:.3f} to {target_power:.3f}")
+            return new_sampler
+            
+        return sampler
+
     # begin training
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
@@ -649,7 +1011,12 @@ if __name__ == "__main__":
                 val_loss = 0.0
                 for _ in range(val_steps):  # always fiexed number of validation steps
                     x_val, y_val = val_loader.next_batch()
-                    _, loss = model(x_val, y_val, return_logits=False)
+                    if args.negative_sampling:
+                        # For negative sampling, compute full cross-entropy for benchmark comparison
+                        loss = compute_full_cross_entropy_loss(model, x_val, y_val)
+                    else:
+                        # Standard validation path for dense and adaptive softmax
+                        _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
@@ -709,19 +1076,53 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        
+        # Apply annealing for negative sampling if enabled
+        if args.negative_sampling and len(k_schedule) > 1:
+            sampler = _maybe_anneal_negative_sampling(step, args, k_schedule, power_schedule, k_transition_steps, 
+                                                      raw_model, sampler, freqs, device)
+        
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
         torch.cuda.synchronize()
-        # time and print
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        # tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        # Calculate detailed timing and throughput metrics
+        step_time_ms = 1000 * (time.perf_counter() - t0)
+        approx_training_time_ms = training_time_ms + step_time_ms
+        
+        # Calculate tokens per second for this step (skip step 0 as it's often an outlier)
+        if step > 0:
+            tokens_this_step = tokens_per_iter
+            tokens_per_second = tokens_this_step / (step_time_ms / 1000.0)
+            # Calculate average tokens per second across all completed steps
+            avg_tokens_per_second = ((step + 1) * tokens_per_iter) / (approx_training_time_ms / 1000.0)
+        else:
+            tokens_per_second = 0
+            avg_tokens_per_second = 0
+
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()  # keep track of the mean loss
-        print0(
-            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
-        )
+        
+        # Enhanced logging with more useful metrics
+        if step > 0:  # Skip step 0 for cleaner logs
+            current_k = getattr(raw_model.neg_loss, 'k', 'N/A') if args.negative_sampling and hasattr(raw_model, 'neg_loss') else 'N/A'
+            current_power = getattr(sampler, 'power', 'N/A') if args.negative_sampling and sampler is not None else 'N/A'
+            
+            log_msg = (f"step:{step}/{args.num_iterations} | "
+                      f"loss {lossf:.6f} | "
+                      f"lr {lr:.2e} | "
+                      f"step_time:{step_time_ms:.1f}ms | "
+                      f"step_avg:{approx_training_time_ms/(step+1):.2f}ms | "
+                      f"tok/s:{tokens_per_second/1e6:.2f}M | "
+                      f"avg_tok/s:{avg_tokens_per_second/1e6:.2f}M")
+            
+            if args.negative_sampling:
+                log_msg += f" | k:{current_k} | pow:{current_power:.2f}" if current_power != 'N/A' else f" | k:{current_k}"
+                
+            print0(log_msg)
+        else:
+            print0(f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | warmup step")
+        
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
