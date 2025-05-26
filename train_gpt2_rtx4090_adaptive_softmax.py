@@ -182,22 +182,29 @@ class GPT(nn.Module):
         x = rmsnorm(x)
 
         if self.use_asoft:
+            original_x_dtype = x.dtype # Store original dtype, e.g., bfloat16
+            x_for_asoft = x.to(torch.float32) # Cast input to asoft to float32
+
             if targets is not None:
-                # training/validation path - keep asoft in FP32, cast inputs/outputs
-                x_fp32 = x.view(-1, x.size(-1)).float()
-                targets_flat = targets.view(-1)
-                
-                # asoft operates in FP32
-                output_asoft = self.asoft(x_fp32, targets_flat)
-                loss = output_asoft.loss
-                
+                # training/validation path
+                reshaped_x_for_asoft = x_for_asoft.view(-1, x_for_asoft.size(-1))
+                reshaped_targets = targets.view(-1) # targets are long, no cast needed
+
+                # self.asoft parameters are float32, input is float32
+                output_asoft = self.asoft(reshaped_x_for_asoft, reshaped_targets)
+                loss = output_asoft.loss.to(original_x_dtype) # Cast loss back
+
                 if return_logits:
-                    logits = self.asoft.log_prob(x_fp32).to(x.dtype)
+                    # self.asoft.log_prob expects float32 input, will produce float32 output
+                    logits_float = self.asoft.log_prob(x_for_asoft) 
+                    logits = logits_float.to(original_x_dtype) # Cast logits back
                 else:
                     logits = None
             else:
                 # inference-time: only forward on the very last position
-                logits = self.asoft.log_prob(x[:, [-1], :].float()).to(x.dtype)
+                # self.asoft.log_prob expects float32 input
+                logits_float = self.asoft.log_prob(x_for_asoft[:, [-1], :])
+                logits = logits_float.to(original_x_dtype) # Cast logits back
                 loss = None
         else:
             # original dense lm_head path
@@ -568,13 +575,11 @@ if __name__ == "__main__":
     
     # Cast model parameters to the specified precision (dtype)
     if dtype != torch.float32: # For bf16 or fp16
-        # First, cast the entire model to the target precision (e.g., bfloat16)
         model.to(dtype=dtype)
-        # Then, if adaptive softmax is used, cast the asoft module back to float32
-        # This ensures all parameters and buffers within asoft are float32
         if use_asoft and hasattr(model, 'asoft'):
+            # Cast AdaptiveLogSoftmaxWithLoss module to float32 to handle internal dtype issues
             model.asoft.to(torch.float32)
-            print0(f"Casted model.asoft and its submodules to torch.float32. Rest of model is {args.precision}.")
+            print0(f"Casting model.asoft to torch.float32 for compatibility with {args.precision}.")
     else: # For fp32
         model.to(torch.float32) # Ensure it is float32 if that's the target
 
@@ -584,38 +589,12 @@ if __name__ == "__main__":
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     print0("compiling the model...")
     model = torch.compile(
-        model, mode="reduce-overhead"
+        model
     )  # NOTE: this might cause issues depending on your GPU, consider turning it off
-
-    # If adaptive softmax is active, wrap it so torch.compile skips it
-    if use_asoft and hasattr(model, "asoft"):
-        class NonCompiledWrapper(nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-                # Flag to tell torch.compile to leave this module untouched
-                self._is_compiling = True
-
-            def forward(self, *args, **kwargs):
-                return self.module(*args, **kwargs)
-
-        model.asoft = NonCompiledWrapper(model.asoft)
 
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module  # already in the script
-
-    # Compile *training* graph (includes backward) but ask Inductor to skip asoft
-    #   1) mode="reduce-overhead" → smallest graph-break cost
-    #   2) fullgraph=False + dynamic=True → no recompiles on shape changes
-    import torch._dynamo
-    model = torch.compile(model,
-                          mode="reduce-overhead",
-                          dynamic=True,
-                          fullgraph=False)
-
-    print0("torch.compile enabled - transformer gets fused kernels, "
-           "AdaptiveSoftmax left in eager-FP32.")
+    raw_model = model.module  # always contains the "raw" unwrapped model
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(
