@@ -4,7 +4,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim2.py \
   --output_dir pylog124M_neg_sampling_fast \
   --model d12 \
   --batch_size 16 \
-  --grad_accumulation_steps 32 \
+  --grad_accumulation_steps 16 \
   --sequence_length 1024 \
   --val_sequence_length 1024 \
   --val_loss_every 128 \
@@ -16,8 +16,8 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim2.py \
   --warmdown_iters 1024 \
   --negative_sampling \
   --ns_shared_negatives \
-  --ns_k_schedule 12,8,4 \
-  --ns_power_schedule 0.7,0.55,0.4 \
+  --ns_k_schedule 16,12,8 \
+  --ns_power_schedule 1.0,0.85,0.75 \
   --ns_table_size 1000000 \
   --precision bf16 \
   --log_wandb 
