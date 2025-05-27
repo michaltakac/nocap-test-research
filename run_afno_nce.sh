@@ -1,24 +1,29 @@
-torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim2.py \
+torchrun --standalone --nproc_per_node=1 train_gpt2_afno_nce.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir pylog124M_neg_sampling_fast \
   --model d12 \
   --batch_size 16 \
-  --grad_accumulation_steps 16 \
+  --grad_accumulation_steps 32 \
   --sequence_length 1024 \
   --val_sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \
-  --num_iterations 8000 \
+  --num_iterations 2000 \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
-  --warmup_iters 256 \
-  --warmdown_iters 1024 \
+  --warmup_iters 64 \
+  --warmdown_iters 256 \
   --target_val_loss 3.3821 \
+  --mixer "afno" \
+  --afno_num_blocks 8 \
+  --afno_sparsity_threshold 0.01 \
+  --afno_hard_thresholding_fraction 0.3 \
+  --afno_hidden_size_factor 1 \
   --negative_sampling \
   --ns_shared_negatives \
-  --ns_k_schedule 16,12,8 \
-  --ns_power_schedule 1.0,0.85,0.75 \
+  --ns_k 12 \
+  --ns_power 0.55 \
   --ns_table_size 1000000 \
   --precision bf16 \
   --log_wandb 
