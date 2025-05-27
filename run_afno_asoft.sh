@@ -23,4 +23,4 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_afno_asoft_clean.py \
   --afno_hard_thresholding_fraction 1.0 \
   --afno_hidden_size_factor 1 \
   --precision bf16 \
-  #--log_wandb
+  --log_wandb

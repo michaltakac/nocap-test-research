@@ -120,20 +120,27 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
-        if config.mixer == "afno":
-            self.mixer = AFNO1D(
-                hidden_size=config.n_embd, 
-                num_blocks=config.afno_num_blocks, 
-                sparsity_threshold=config.afno_sparsity_threshold,
-                hard_thresholding_fraction=config.afno_hard_thresholding_fraction,
-                hidden_size_factor=config.afno_hidden_size_factor
-            )
-        elif config.mixer == "attn":
-            self.mixer = CausalSelfAttention(config) # Was self.attn
-        else:
-            raise ValueError(f"Unknown mixer type: {config.mixer}")
+        self.layer_idx = layer_idx
+
+        # Alternate mixer based on layer_idx
+        if self.layer_idx % 2 == 0: # Even layers use AFNO
+            if config.mixer == "afno": # Check if AFNO is the intended primary mixer type
+                self.mixer = AFNO1D(
+                    hidden_size=config.n_embd, 
+                    num_blocks=config.afno_num_blocks, 
+                    sparsity_threshold=config.afno_sparsity_threshold,
+                    hard_thresholding_fraction=config.afno_hard_thresholding_fraction,
+                    hidden_size_factor=config.afno_hidden_size_factor
+                )
+            elif config.mixer == "attn": # Fallback or if explicitly set to attn for even layer (unusual for hybrid)
+                print(f"Warning: Layer {self.layer_idx} (even) is using CausalSelfAttention, but config.mixer is '{config.mixer}'. Ensure this is intended for hybrid setup.")
+                self.mixer = CausalSelfAttention(config)
+            else:
+                raise ValueError(f"Unknown mixer type for even layer: {config.mixer}")
+        else: # Odd layers use CausalSelfAttention
+            self.mixer = CausalSelfAttention(config)
         
         self.mlp = MLP(config)
         self.mixer_scale = 1 / math.sqrt(2 * config.n_layer) # Renamed from attn_scale
@@ -172,9 +179,8 @@ class GPT(nn.Module):
 
         modules = dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h=nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         )
-        # Add wpe only if not using attention (which uses RoPE internally)
         if self.config.mixer == "afno":
             modules['wpe'] = nn.Embedding(config.sequence_length, config.n_embd)
         
@@ -202,15 +208,17 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
-        if self.config.mixer == "afno":
-            # For AFNO, add absolute positional embeddings
+        # Add positional embeddings if 'wpe' exists (i.e., if AFNO is part of the model)
+        # CausalSelfAttention layers will use their internal RoPE regardless.
+        # Channel-wise AFNO layers don't inherently use sequence position but might benefit from global pos_emb.
+        if 'wpe' in self.transformer:
             assert t <= self.config.sequence_length, \
                 f"Sequence length {t} exceeds model configured sequence_length {self.config.sequence_length}"
             pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
             x = tok_emb + pos_emb
         else:
-            # For attention (RoPE), no explicit addition of wpe here as RoPE handles pos info in CausalSelfAttention
+            # If no 'wpe' (e.g. pure attention model), just use token embeddings
             x = tok_emb
             
         for block in self.transformer.h:
