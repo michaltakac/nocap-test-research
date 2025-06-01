@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 # Import LightRNN modules
-from lightrnn_old import LightRNNCodebook, LightRNNEmbedding, LightRNNDecoder
+from lightrnn import LightRNNCodebook, LightRNNEmbedding, LightRNNDecoder
 
 with open(sys.argv[0]) as f:
     code = f.read()
