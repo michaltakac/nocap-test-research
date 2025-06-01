@@ -11,7 +11,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn_afno.py \
   --num_iterations 5000 \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
-  --warmup_iters 256 \
+  --warmup_iters 512 \
   --warmdown_iters 1024 \
   --target_val_loss 3.3821 \
   --tie_embedding light \

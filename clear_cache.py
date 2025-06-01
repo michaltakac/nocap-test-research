@@ -4,7 +4,7 @@ import torch.nn as nn
 
 def memory_stats():
     print(torch.cuda.memory_allocated()/1024**2)
-    print(torch.cuda.memory_cached()/1024**2)
+    print(torch.cuda.memory_reserved()/1024**2)
 
 
 def allocate():

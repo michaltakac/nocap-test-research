@@ -8,11 +8,12 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn.py \
   --sequence_length 2048 \
   --val_loss_every 64 \
   --val_batch_size 32 \
-  --num_iterations 5000 \
+  --num_iterations 3000 \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
   --target_val_loss 3.3821 \
   --tie_embedding light \
+  --table_size 256 \
   --log_wandb

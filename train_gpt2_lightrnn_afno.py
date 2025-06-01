@@ -704,7 +704,7 @@ if __name__ == "__main__":
     # special mode that disables CUDA-graphs entirely but keeps Triton /
     # template autotuning – we keep most of the speed-up (≈2× over eager)
     # without the runtime crash.
-    model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+    model = torch.compile(model)
 
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
