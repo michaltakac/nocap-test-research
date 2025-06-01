@@ -1,4 +1,4 @@
-torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn.py \
+torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn_cocont_mtp.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir pylog124M_lightrnn \
@@ -8,7 +8,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn.py \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \
-  --num_iterations 5000 \
+  --num_iterations 5500 \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
@@ -20,4 +20,8 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn.py \
   --cocont_alpha 0.1 \
   --ngram_path "data/fineweb10B/bigram_topk16.pt" \
   --ngram_k 16 \
-  #--log_wandb
+  --mtp_enabled \
+  --mtp_max_steps 3 \
+  --mtp_weight 0.2 \
+  --mtp_rampup_steps 64 \
+  #--log_wandb # todo: needs tuning

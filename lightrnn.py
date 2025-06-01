@@ -101,7 +101,7 @@ class LightRNNDecoder(nn.Module):
             self.register_parameter("col_u", None)
             self.register_parameter("col_v", None)
 
-    def forward(self, hidden_states, target_ids=None):
+    def forward(self, hidden_states, target_ids=None, ngram_row_dist=None, cocont_alpha: float = 0.0):
         """LightRNN factored soft-max.
 
         Args:
@@ -138,11 +138,23 @@ class LightRNNDecoder(nn.Module):
             # Individually normalised log-softmax for row and column branch.
             # This is the correct factorised NLL:  −log P(row=r) −log P(col=c | r).
 
-            loss_row = F.cross_entropy(
-                row_logits.reshape(-1, self.table_size),
-                row_ids_flat,
-            )
+            # ----------------------------------------------------------
+            # CoCoNT row-label smoothing
+            # ----------------------------------------------------------
+            if cocont_alpha > 0.0 and ngram_row_dist is not None:
+                # ngram_row_dist: (B,T,R) → (N,R)
+                row_targets_smooth = (1.0 - cocont_alpha) * F.one_hot(
+                    row_ids_flat, num_classes=self.table_size
+                ).to(row_logits.dtype) + cocont_alpha * ngram_row_dist.reshape(-1, self.table_size).to(row_logits.dtype)
 
+                log_probs_row = F.log_softmax(row_logits.reshape(-1, self.table_size), dim=-1)
+                loss_row = -(row_targets_smooth * log_probs_row).sum(-1).mean()
+            else:
+                loss_row = F.cross_entropy(
+                    row_logits.reshape(-1, self.table_size),
+                    row_ids_flat,
+                )
+            
             loss_col = F.cross_entropy(logits, col_ids_flat)
 
             loss = loss_row + loss_col
@@ -168,3 +180,46 @@ class LightRNNDecoder(nn.Module):
         col_logits_last = torch.baddbmm(b_r.unsqueeze(1), last_hidden, w_r)  # (B,1,R)
 
         return (last_row_logits, col_logits_last), None 
+
+    # --------------------------------------------------------------
+    # Efficient multi-target loss used by MTP: we receive a dict of
+    # {"target_k": Tensor(B,T)}.  We compute the *row* logits once
+    # and reuse them for every k.  Column logits are still computed
+    # per-row but we avoid re-running the expensive row projection.
+    # --------------------------------------------------------------
+    def loss_multi(self, hidden_states, targets_dict, row_logits_cached=None):
+        """Return combined CE loss (mean over dict values).
+
+        Args:
+            hidden_states : (B,T,d)
+            targets_dict  : mapping of {key: Tensor(B,T)}; keys order ignored
+            row_logits_cached : pre-computed (B,T,R) tensor if available
+        """
+        if row_logits_cached is None:
+            row_logits_cached = self.to_row_logits(hidden_states)
+
+        B, T, _ = hidden_states.shape
+        hs_flat = hidden_states.reshape(-1, self.n_embd)  # (N,d)
+
+        losses = []
+        for tgt in targets_dict.values():
+            tgt_row, tgt_col = self.codebook.lookup(tgt)          # (B,T)
+            row_ids_flat = tgt_row.reshape(-1)
+            col_ids_flat = tgt_col.reshape(-1)
+
+            # Row loss (reuse cached logits)
+            loss_row = F.cross_entropy(
+                row_logits_cached.view(-1, self.table_size), row_ids_flat
+            )
+
+            # Column logits – gather weights once
+            W_tok = self.col_weight[row_ids_flat].to(hs_flat.dtype)
+            b_tok = self.col_bias[row_ids_flat].to(hs_flat.dtype)
+            logits_col = torch.baddbmm(
+                b_tok.unsqueeze(1), hs_flat.unsqueeze(1), W_tok
+            )[:, 0]
+            loss_col = F.cross_entropy(logits_col, col_ids_flat)
+
+            losses.append(loss_row + loss_col)
+
+        return torch.stack(losses).mean()

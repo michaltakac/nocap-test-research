@@ -20,6 +20,8 @@ import torch.nn.functional as F
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+# Import Multi-Token Prediction helper
+from mtp_utils import compute_mtp_loss
 
 # Import LightRNN modules
 from lightrnn import LightRNNCodebook, LightRNNEmbedding, LightRNNDecoder
@@ -150,6 +152,11 @@ class GPTConfig:
     # LightRNN parameters
     tie_embedding: str = field(default="full", metadata={"choices": ["full", "light"]})
     table_size: int = 0  # Will be calculated if using light embedding
+    # Multi-Token Prediction parameters
+    mtp_enabled: bool = False
+    mtp_max_steps: int = 1  # If >1, include auxiliary loss for 2..mtp_max_steps
+    mtp_weight: float = 0.1
+    mtp_rampup_steps: int = 256  # Linear ramp-up of mtp_weight from 0
 
 
 class GPT(nn.Module):
@@ -184,6 +191,12 @@ class GPT(nn.Module):
             self.codebook = None
             self.decoder = None
 
+        # Register MTP weight as buffer for torch.compile friendliness
+        self.register_buffer(
+            "mtp_weight_buffer",
+            torch.tensor(config.mtp_weight, dtype=torch.float32),
+        )
+
     def forward(self, idx, targets=None, ngram_row_dist=None, cocont_alpha: float = 0.0, return_logits=True):
         b, t = idx.size()
         # pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # Not used with RoPE
@@ -196,35 +209,70 @@ class GPT(nn.Module):
         x = rmsnorm(x)
 
         if self.config.tie_embedding == "light":
-            # LightRNN handles loss calculation internally if targets are provided
-            # and returns its own form of "logits" (e.g., row_logits)
-            logits, loss = self.decoder(
-                x,
-                targets,
-                ngram_row_dist=ngram_row_dist,
-                cocont_alpha=cocont_alpha,
-            )
-        else:
-            # Standard GPT behavior
-            if targets is not None:
-                logits = self.lm_head(x)
-                if cocont_alpha > 0.0 and ngram_row_dist is not None:
-                    # Build full token-level smoothed target (costly) – fall back to label smoothing over
-                    # tokens present in top-K list only.  We approximate by distributing the alpha mass
-                    # uniformly over those K tokens.
-                    # ngram_row_dist is for LightRNN; for full softmax we don't have top-K probs here, so
-                    # we apply simple uniform smoothing as a lightweight approximation.
-                    # One could extend this by passing explicit token_probs instead.
-                    one_hot = F.one_hot(targets, num_classes=self.config.vocab_size).float()
-                    smooth = (1 - cocont_alpha) * one_hot + cocont_alpha / self.config.vocab_size
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    loss = -(smooth * log_probs).sum(-1).mean()
-                else:
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-                    )
+            # ------------------------------------------------------------------
+            # LightRNN path – we may receive either a Tensor (legacy) or a dict
+            # with keys target_1..K for MTP.  We fall back to standard behaviour
+            # when mtp is disabled or only target_1 is present.
+            # ------------------------------------------------------------------
+            if targets is None:
+                logits, loss = self.decoder(x, None)  # generation path
             else:
-                logits = self.lm_head(x[:, [-1], :])
+                if isinstance(targets, dict):
+                    # Main loss (k=1)
+                    logits_dummy, main_loss = self.decoder(
+                        x,
+                        targets["target_1"],
+                        ngram_row_dist=ngram_row_dist,
+                        cocont_alpha=cocont_alpha,
+                    )
+
+                    total_loss = main_loss
+
+                    if self.config.mtp_enabled and self.config.mtp_max_steps > 1:
+                        # Build dict of auxiliary targets only
+                        aux_targets = {
+                            k: v for k, v in targets.items() if k != "target_1"
+                        }
+                        if aux_targets:
+                            aux_loss = self.decoder.loss_multi(
+                                x, aux_targets
+                            )
+                            total_loss = main_loss + self.mtp_weight_buffer * aux_loss
+
+                    logits = logits_dummy
+                    loss = total_loss
+                else:
+                    # Non-MTP single target tensor
+                    logits, loss = self.decoder(
+                        x,
+                        targets,
+                        ngram_row_dist=ngram_row_dist,
+                        cocont_alpha=cocont_alpha,
+                    )
+        else:
+            # ------------------------------------------------------------------
+            # Full softmax path – we can use the helper compute_mtp_loss for MTP.
+            # ------------------------------------------------------------------
+            logits = self.lm_head(x) if targets is not None else self.lm_head(x[:, [-1], :])
+
+            if targets is not None:
+                if isinstance(targets, dict):
+                    total_loss, _, _ = compute_mtp_loss(
+                        logits, targets, self.mtp_weight_buffer, ignore_index=-1
+                    )
+                    loss = total_loss
+                else:
+                    # Non-MTP single target tensor
+                    if cocont_alpha > 0.0 and ngram_row_dist is not None:
+                        one_hot = F.one_hot(targets, num_classes=self.config.vocab_size).float()
+                        smooth = (1 - cocont_alpha) * one_hot + cocont_alpha / self.config.vocab_size
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        loss = -(smooth * log_probs).sum(-1).mean()
+                    else:
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+                        )
+            else:
                 loss = None
         
         # Detach outputs from the internal CUDA-graph memory so that subsequent
@@ -318,11 +366,14 @@ def _load_data_shard(filename):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes, mtp_enabled=False, mtp_max_steps=1):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.mtp_enabled = mtp_enabled
+        # actual prediction steps (at least 1)
+        self.actual_max_pred_steps = mtp_max_steps if mtp_enabled else 1
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -334,7 +385,7 @@ class DistributedDataLoader:
         ntok_total = np.int64(0)
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
+            assert shard_ntok >= num_processes * B * T + self.actual_max_pred_steps
             ntok_total += shard_ntok
         self.ntok_total = ntok_total
         print0(
@@ -357,15 +408,25 @@ class DistributedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        buf_len = B * T + self.actual_max_pred_steps
+        buf = self.tokens[self.current_position : self.current_position + buf_len]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)  # targets
-        # advance current position and load next shard if necessary
+
+        x = (buf[: B * T]).view(B, T)  # input tokens
+
+        # Build targets dictionary for 1..K prediction steps
+        targets_dict = {}
+        for k in range(1, self.actual_max_pred_steps + 1):
+            targets_dict[f"target_{k}"] = (buf[k : B * T + k]).view(B, T)
+
+        # advance current position and manage shard rollover
         self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        if self.current_position + (B * T * self.num_processes + self.actual_max_pred_steps) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+
+        # Move to CUDA
+        targets_dict_cuda = {k: v.cuda() for k, v in targets_dict.items()}
+        return x.cuda(), targets_dict_cuda
 
 
 # -----------------------------------------------------------------------------
@@ -526,6 +587,32 @@ if __name__ == "__main__":
         default=16,
         help="Number of top tokens stored per previous token in bigram model",
     )
+    # ------------------------------------------------------------------
+    # Multi-Token Prediction (MTP) arguments
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--mtp_enabled",
+        action="store_true",
+        help="Enable Multi-Token Prediction auxiliary loss",
+    )
+    parser.add_argument(
+        "--mtp_max_steps",
+        type=int,
+        default=2,
+        help="Predict up to k steps ahead (k>=2) when MTP is enabled",
+    )
+    parser.add_argument(
+        "--mtp_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the auxiliary MTP loss",
+    )
+    parser.add_argument(
+        "--mtp_rampup_steps",
+        type=int,
+        default=256,
+        help="Linear ramp-up steps for MTP weight from 0 to --mtp_weight",
+    )
 
     args = parser.parse_args()
 
@@ -586,7 +673,15 @@ if __name__ == "__main__":
     ctx = torch.amp.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype!=torch.float32)
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(
+        args.input_bin,
+        B,
+        T,
+        ddp_rank,
+        ddp_world_size,
+        mtp_enabled=args.mtp_enabled,
+        mtp_max_steps=args.mtp_max_steps if args.mtp_enabled else 1,
+    )
 
     # ------------------------------------------------------------------
     # Load n-gram model for CoCoNT smoothing (if enabled)
@@ -604,9 +699,15 @@ if __name__ == "__main__":
     val_steps = VAL_TOKENS // tokens_per_iter_val
 
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
+        args.input_val_bin,
+        args.val_batch_size,
+        T,
+        ddp_rank,
+        ddp_world_size,
+        mtp_enabled=args.mtp_enabled,
+        mtp_max_steps=args.mtp_max_steps if args.mtp_enabled else 1,
     )
-    x, y = train_loader.next_batch()
+    x, targets_dict = train_loader.next_batch()
 
     # init the model from scratch
     num_vocab = 50257
@@ -623,7 +724,11 @@ if __name__ == "__main__":
         sequence_length=args.sequence_length,
         precision=args.precision,
         tie_embedding=args.tie_embedding,
-        table_size=args.table_size
+        table_size=args.table_size,
+        mtp_enabled=args.mtp_enabled,
+        mtp_max_steps=args.mtp_max_steps,
+        mtp_weight=args.mtp_weight,
+        mtp_rampup_steps=args.mtp_rampup_steps,
     )
     # decide parameter / activation dtype
     if args.precision == "bf16":
@@ -701,6 +806,14 @@ if __name__ == "__main__":
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
 
+        # Update MTP weight buffer early so both val and training steps use current weight
+        if args.mtp_enabled:
+            if step < args.mtp_rampup_steps:
+                current_mtp_weight = (step / args.mtp_rampup_steps) * args.mtp_weight
+            else:
+                current_mtp_weight = args.mtp_weight
+            raw_model.mtp_weight_buffer.fill_(current_mtp_weight)
+
         # once in a while evaluate the validation dataset
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             # stop the clock
@@ -711,7 +824,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 val_loss = 0.0
                 for _ in range(val_steps):  # always fiexed number of validation steps
-                    x_val, y_val = val_loader.next_batch()
+                    x_val, val_targets = val_loader.next_batch()
                     # Ensure return_logits=False if LightRNN handles loss internally and its "logits" are not vocab-sized
                     torch.compiler.cudagraph_mark_step_begin()
                     if args.use_cocont and raw_model.codebook is not None:
@@ -725,9 +838,12 @@ if __name__ == "__main__":
                     else:
                         row_dist_val = None
                     # Ensure return_logits=False if LightRNN handles loss internally and its "logits" are not vocab-sized
+                    target_for_val = (
+                        val_targets["target_1"] if args.mtp_enabled else val_targets
+                    )
                     _, loss = model(
                         x_val,
-                        y_val,
+                        target_for_val,
                         ngram_row_dist=row_dist_val,
                         cocont_alpha=args.cocont_alpha if args.use_cocont else 0.0,
                         return_logits=False,
@@ -781,7 +897,7 @@ if __name__ == "__main__":
                 # Ensure return_logits=False if LightRNN handles loss internally
                 _, loss = model(
                     x,
-                    y,
+                    targets_dict,
                     ngram_row_dist=row_dist,
                     cocont_alpha=args.cocont_alpha if args.use_cocont else 0.0,
                     return_logits=False,
@@ -789,7 +905,7 @@ if __name__ == "__main__":
                 loss = loss / args.grad_accumulation_steps
                 train_loss_accum += loss.item() # Accumulate .item() to save memory
             
-            x, y = train_loader.next_batch()
+            x, targets_dict = train_loader.next_batch()
             loss.backward() # No scaler needed for AdamW with BF16/FP32
 
         # Convert accumulated loss back to tensor for DDP reduction
