@@ -20,4 +20,4 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn.py \
   --cocont_alpha 0.1 \
   --ngram_path "data/fineweb10B/bigram_topk16.pt" \
   --ngram_k 16 \
-  #--log_wandb
+  --log_wandb

@@ -21,7 +21,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn_cocont_mtp.py \
   --ngram_path "data/fineweb10B/bigram_topk16.pt" \
   --ngram_k 16 \
   --mtp_enabled \
-  --mtp_max_steps 3 \
-  --mtp_weight 0.2 \
-  --mtp_rampup_steps 64 \
-  #--log_wandb # todo: needs tuning
+  --mtp_max_steps 4 \
+  --mtp_weight 0.3 \
+  --mtp_rampup_steps 128 \
+  --log_wandb
