@@ -1,0 +1,25 @@
+torchrun --standalone --nproc_per_node=1 train_bottlecap.py \
+  --input_bin "data/fineweb10B/fineweb_train_*.bin" \
+  --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
+  --output_dir pylog124M_bottlecap \
+  --model d12 \
+  --batch_size 32 \
+  --grad_accumulation_steps 32 \
+  --sequence_length 256 \
+  --curriculum_seq_lens "256,512,1024" \
+  --curriculum_iters "0,1000,2500" \
+  --stochastic_depth_prob 0.1 \
+  --stochastic_depth_anneal 2000 \
+  --adaptive_softmax \
+  --asoft_cutoffs "2000,10000" \
+  --asoft_div_value 4.0 \
+  --val_loss_every 128 \
+  --val_batch_size 16 \
+  --val_sequence_length 1024 \
+  --num_iterations 4768 \
+  --weight_decay 0.1 \
+  --learning_rate 0.0018 \
+  --warmup_iters 256 \
+  --warmdown_iters 1024 \
+  --target_val_loss 3.3821 \
+  --log_wandb
