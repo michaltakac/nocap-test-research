@@ -3,20 +3,23 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim2.py \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir pylog124M \
   --model d12 \
-  --batch_size 32 \
-  --grad_accumulation_steps 32 \
-  --sequence_length 3072 \
+  --batch_size 16 \
+  --grad_accumulation_steps 16 \
+  --sequence_length 2048 \
   --val_loss_every 128 \
   --val_batch_size 16 \
-  --num_iterations 16000 \
-  --weight_decay 0.1 \
-  --learning_rate 0.0018 \
-  --warmup_iters 1200 \
-  --warmdown_iters 3200 \
+  --val_sequence_length 1024 \
+  --num_iterations 9000 \
+  --weight_decay 0.05 \
+  --learning_rate 0.0012 \
+  --warmup_iters 512 \
+  --warmdown_iters 4096 \
   --target_val_loss 3.3821 \
   --negative_sampling \
-  --ns_k 12 \
-  --ns_power 0.55 \
+  --ns_k 64 \
+  --ns_k_schedule "64,128,256" \
+  --ns_power 0.75 \
+  --ns_power_schedule "0.75,0.6,0.5" \
   --ns_shared_negatives \
   --precision bf16 \
   --log_wandb 

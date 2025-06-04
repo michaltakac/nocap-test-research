@@ -217,16 +217,23 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim2.py \
   --other_flags...
 ```
 
-**Advanced Features - Annealing Schedules:**
+**Enhanced Logging**: Per-step metrics include current k/power, tokens/s, step timing
 
-10. **Dynamic Hyperparameter Annealing:**
-    - `--ns_k_schedule "24,12,8"`: Comma-separated k values for progressive annealing
-    - `--ns_power_schedule "0.75,0.6,0.5"`: Corresponding power values for each phase
-    - `--val_sequence_length 2048`: Separate validation sequence length to maintain fixed VAL_TOKENS
-    - **Annealing Logic**: `_maybe_anneal_negative_sampling()` function called each step
-    - **Transition Points**: For 3-value schedules: 30% → 40% → 30% of total iterations
-    - **Sampler Rebuilding**: Automatic reconstruction when power changes
-    - **Enhanced Logging**: Per-step metrics include current k/power, tokens/s, step timing
+#### June 2025 Memory & Stability Fixes
+
+Following live testing the initial NCE implementation ran into GPU OOM (~6 GiB spike) and compile-time instability at step ≈ 2700.  Two fixes were merged:
+
+1. **Memory-efficient shared-negative path**  
+   • When `--ns_shared_negatives` is active we now keep the `k` negative embeddings in a `(k,d)` matrix and compute scores via a single `matmul`, instead of expanding to `(B*T,k,d)`.  
+   • Saves ~6 GiB for the default `k=64, B=16, T=2048` setup and removes the OOM.
+
+2. **Safer Torch Compile Policy**  
+   • `torch.compile` is now *skipped* when `--negative_sampling` is enabled.  Inductor's fused kernels were still allocating large transient buffers even with `cudagraphs` disabled.  
+   • For the non-NCE paths we still compile with `mode="max-autotune-no-cudagraphs"`.
+
+These changes stabilise training beyond the 3-phase k-schedule (64→128→256) without exceeding the 23 GiB budget on a single RTX 4090.
+
+> **Note**: Even with the memory fix NCE continues to plateau ≈ 4.8 val-loss, indicating an objective-convergence limitation rather than a resource one (see Experimental Results below).
 
 **Experimental Results and Analysis (December 2024):**
 

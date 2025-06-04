@@ -249,25 +249,33 @@ class NegSamplingLoss(nn.Module):
         batch_size = h.shape[0]
         
         if self.shared:
-            # Sample k negatives shared across the batch
+            # Sample k negatives shared across the batch (memory-efficient)
             neg = self.sampler.sample(self.k)  # (k,)
-            neg = neg.unsqueeze(0).expand(batch_size, self.k)  # (B*T, k)
+            w_neg = self.weight[neg]           # (k, d)
+
+            # Compute scores efficiently without expanding w_neg for every token
+            noise_logprob = torch.log(self.sampler.prob_table[neg])  # (k,)
+            # Positive correction still depends on each token
+            noise_logprob_full = torch.log(self.sampler.prob_table)  # (V,)
+
+            pos_corr = noise_logprob_full[target] + math.log(self.k)  # (B*T,)
+            # h: (B*T,d)  w_neg.T: (d,k)  -> (B*T,k)
+            s_pos = (h * self.weight[target]).sum(-1) - pos_corr
+            s_neg = torch.matmul(h, w_neg.t()) - noise_logprob.unsqueeze(0)
         else:
-            # Sample k negatives per token
+            # Sample k negatives per token (fallback path, potentially high mem)
             neg = self.sampler.sample(batch_size * self.k).view(batch_size, self.k)
-        
-        # Get embeddings for positive and negative samples
-        w_pos = self.weight[target]  # (B*T, d)
-        w_neg = self.weight[neg]     # (B*T, k, d)
-        
-        # Compute scores
-        noise_logprob = torch.log(self.sampler.prob_table)   # on device
-        pos_corr = noise_logprob[target] + math.log(self.k)
-        neg_corr = noise_logprob[neg]                        # (B*T,k)
 
-        s_pos = (h * w_pos).sum(-1) - pos_corr
-        s_neg = torch.einsum('bd,bkd->bk', h, w_neg) - neg_corr
+            w_pos = self.weight[target]  # (B*T, d)
+            w_neg = self.weight[neg]     # (B*T, k, d)
 
+            noise_logprob = torch.log(self.sampler.prob_table)   # (V,)
+            pos_corr = noise_logprob[target] + math.log(self.k)
+            neg_corr = noise_logprob[neg]                        # (B*T,k)
+
+            s_pos = (h * w_pos).sum(-1) - pos_corr
+            s_neg = torch.einsum('bd,bkd->bk', h, w_neg) - neg_corr
+        
         loss = -F.logsigmoid(s_pos).mean() - F.logsigmoid(-s_neg).mean()
         return loss
 
@@ -916,8 +924,14 @@ if __name__ == "__main__":
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     print0("compiling the model...")
     
-    # Compile the rest of the model with reduce-overhead mode
-    model = torch.compile(model, mode="reduce-overhead")
+    # Torch.compile still causes large fused kernels for NegSampling; skip when enabled
+    if not args.negative_sampling:
+        model = torch.compile(
+            model,
+            options={"triton.cudagraphs": False},
+        )
+    else:
+        print0("Skipping torch.compile for negative sampling to reduce memory usage.")
 
     # If adaptive softmax is active, wrap it so torch.compile skips it
     if use_asoft and hasattr(model, "asoft"):

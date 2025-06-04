@@ -4,15 +4,15 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn_cocont_mtp.py \
   --output_dir pylog124M_lightrnn \
   --model d12 \
   --batch_size 16 \
-  --grad_accumulation_steps 32 \
+  --grad_accumulation_steps 8 \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \
   --num_iterations 5500 \
   --weight_decay 0.1 \
-  --learning_rate 0.0018 \
+  --learning_rate 0.0045 \
   --warmup_iters 256 \
-  --warmdown_iters 2048 \
+  --warmdown_iters 3000 \
   --target_val_loss 3.3821 \
   --tie_embedding light \
   --table_size 256 \
@@ -20,8 +20,5 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_lightrnn_cocont_mtp.py \
   --cocont_alpha 0.1 \
   --ngram_path "data/fineweb10B/bigram_topk16.pt" \
   --ngram_k 16 \
-  --mtp_enabled \
-  --mtp_max_steps 4 \
-  --mtp_weight 0.3 \
-  --mtp_rampup_steps 128 \
+  --precision bf16 \
   --log_wandb
