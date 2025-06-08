@@ -578,7 +578,7 @@ if __name__ == "__main__":
         wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
         wandb.config.update(args)
         wandb.save("train_gpt2_rtx4090_optim.py")
-        wandb.save("run.sh")
+        wandb.save("run_optim.sh")
 
     tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
@@ -845,6 +845,9 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
+        # Start timer for precise per-step throughput measurement (training-only)
+        torch.cuda.synchronize()
+        step_start_time = time.perf_counter()
         train_loss = torch.zeros(1, device=device)
         for micro_step in range(args.grad_accumulation_steps):
             model.require_backward_grad_sync = (
@@ -890,15 +893,18 @@ if __name__ == "__main__":
         # everything that follows now is just diagnostics, prints, logging, etc.
 
         torch.cuda.synchronize()
+        step_time_sec = time.perf_counter() - step_start_time
+        tokens_per_sec = tokens_per_iter / step_time_sec
         # time and print
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        # tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        # Aggregate loss across GPUs
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        lossf = train_loss.item()  # keep track of the mean loss
+        lossf = train_loss.item()
         print0(
-            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
+            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | tps {tokens_per_sec:.2f} | tpstep {tokens_per_iter} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
         )
+        if master_process and args.log_wandb:
+            wandb.log({"tokens_per_sec": tokens_per_sec}, step=step * tokens_per_iter)
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:

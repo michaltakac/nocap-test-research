@@ -9,8 +9,18 @@ from dataclasses import dataclass, field
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np
 import torch
+# For BF16 performance
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 # Set TF32 precision for matmul for better performance on Ampere GPUs
-torch.set_float32_matmul_precision('high') 
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # choose fastest algorithm
+# enable efficient FFT plan cache for AFNO layers
+if hasattr(torch.backends.cuda, "enable_mem_efficient_fft"):
+    torch.backends.cuda.enable_mem_efficient_fft(True)
+if hasattr(torch.backends.cuda, "enable_fft_planning_cache"):
+    torch.backends.cuda.enable_fft_planning_cache(True)
 from torch import nn
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 import torch.distributed as dist
@@ -516,7 +526,8 @@ if __name__ == "__main__":
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     print0("compiling the model...")
     model = torch.compile(
-        model
+        model,
+        # options={"triton.cudagraphs": False}
     )  # NOTE: this might cause issues depending on your GPU, consider turning it off
 
     # here we wrap model into DDP container
