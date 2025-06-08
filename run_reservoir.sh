@@ -1,0 +1,22 @@
+torchrun --standalone --nproc_per_node=1 train_reservoir.py \
+  --input_bin "data/fineweb10B/fineweb_train_*.bin" \
+  --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
+  --output_dir pylog_esn_lightrnn \
+  --esn_embed_dim 1024 \
+  --esn_reservoir_size 8192 \
+  --esn_spectral_radius 1.05 \
+  --esn_input_scaling 0.25 \
+  --batch_size 32 \
+  --grad_accumulation_steps 16 \
+  --sequence_length 1024 \
+  --val_sequence_length 1024 \
+  --val_loss_every 128 \
+  --val_batch_size 16 \
+  --num_iterations 6144 \
+  --weight_decay 0.05 \
+  --learning_rate 0.002 \
+  --warmup_iters 256 \
+  --warmdown_iters 0 \
+  --precision bf16 \
+  --target_val_loss 3.3821 \
+  --log_wandb

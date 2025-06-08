@@ -9,13 +9,19 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import AdaptiveLogSoftmaxWithLoss
 torch.set_float32_matmul_precision('high')
 # For BF16 performance
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+# Enable NVIDIA Ampere-level TF32 for matmul and conv for additional speedup (RTX 30/40 series)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch._inductor.config as config
+# Import config from torch._inductor if available for coordinate_descent tuning (helps torch.compile performance)
+try:
+    import torch._inductor.config as config
+except ImportError:
+    config = None  # torch._inductor might not be available in this build; we guard its usage accordingly
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -121,17 +127,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
         self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
-        # stochastic depth probability for this block (may be updated at runtime)
-        self.drop_prob = getattr(config, "stochastic_depth_prob", 0.0)
 
     def forward(self, x):
-        if self.training and self.drop_prob > 0.0:
-            if torch.rand(1, device=x.device) < self.drop_prob:
-                return x  # skip the block entirely
-        scale = 1.0 / (1.0 - self.drop_prob) if self.training and self.drop_prob > 0.0 else 1.0
         x = x + self.attn_scale * self.attn(rmsnorm(x))
         x = x + self.mlp(rmsnorm(x))
-        return x * scale
+        return x
 
 
 # -----------------------------------------------------------------------------
@@ -154,28 +154,16 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.use_asoft = getattr(config, "use_asoft", False)
-        self.asoft_cutoffs = getattr(config, "asoft_cutoffs", None)
-        self.asoft_div_value = getattr(config, "asoft_div_value", 4.0)
-
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             )
         )
-        if self.use_asoft:
-            assert self.asoft_cutoffs is not None, "AdaptiveSoftmax cutoffs must be provided"
-            self.asoft = AdaptiveLogSoftmaxWithLoss(
-                in_features=config.n_embd,
-                n_classes=config.vocab_size,
-                cutoffs=self.asoft_cutoffs,
-                div_value=self.asoft_div_value,
-                head_bias=False,
-            )
-        else:
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            self.transformer.wte.weight = self.lm_head.weight  # weight tying
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = (
+            self.lm_head.weight
+        )  # https://paperswithcode.com/method/weight-tying
 
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
@@ -188,26 +176,21 @@ class GPT(nn.Module):
             x = block(x)
         x = rmsnorm(x)
 
-        if self.use_asoft:
-            x_fp32 = x.to(torch.float32)
-            if targets is not None:
-                out = self.asoft(x_fp32.view(-1, x_fp32.size(-1)), targets.view(-1))
-                loss = out.loss.to(x.dtype)
-                logits = None if not return_logits else self.asoft.log_prob(x_fp32).to(x.dtype)
-            else:
-                logits = self.asoft.log_prob(x_fp32[:, [-1], :]).to(x.dtype)
-                loss = None
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
         else:
-            if targets is not None:
-                logits = self.lm_head(x)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-                )
-            else:
-                logits = self.lm_head(x[:, [-1], :])
-                loss = None
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(
+                x[:, [-1], :]
+            )  # note: using list [-1] to preserve the time dim
+            loss = None
 
-        if not return_logits and not self.use_asoft:
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
             logits = None
 
         return logits, loss
@@ -218,6 +201,205 @@ class GPT(nn.Module):
         )
         return optimizer
 
+
+# -----------------------------------------------------------------------------
+# Echo State Network (ESN) definitions
+
+@dataclass
+class ESNConfig:
+    vocab_size: int = 50257
+    embed_dim: int = 256       # Dimension of token embeddings
+    reservoir_size: int = 2048 # Number of neurons in the reservoir
+    # ESN specific
+    spectral_radius: float = 0.99 # Scales recurrent weights
+    input_scaling: float = 0.1    # Scales input weights
+    # sparsity: float = 0.0 # Sparsity of reservoir weights (0.0 means dense)
+    precision: str = "bf16"
+    use_light_rnn_output: bool = True
+
+    # Derived for LightRNN
+    sqrt_vocab_size: int = 0
+    def __post_init__(self):
+        if self.use_light_rnn_output:
+            self.sqrt_vocab_size = int(math.ceil(math.sqrt(self.vocab_size)))
+
+class ESN(nn.Module):
+    def __init__(self, config: ESNConfig):
+        super().__init__()
+        self.config = config
+        
+        self.wte = nn.Embedding(config.vocab_size, config.embed_dim)
+        # Linear layer to project embeddings to reservoir_size, acting as W_in
+        self.input_proj = nn.Linear(config.embed_dim, config.reservoir_size, bias=False)
+        
+        # The reservoir itself using nn.RNN
+        self.reservoir_rnn = nn.RNN(
+            input_size=config.reservoir_size, # Input features to RNN cell
+            hidden_size=config.reservoir_size, # Size of reservoir state
+            num_layers=1,                      # A single recurrent layer
+            nonlinearity='tanh',               # Standard ESN activation
+            batch_first=True,
+            bias=True                          # Reservoir bias b_x
+        )
+        
+        # Output layer (readout) - only this is trained
+        if config.use_light_rnn_output:
+            self.lm_head1 = nn.Linear(config.reservoir_size, config.sqrt_vocab_size, bias=False)
+            self.lm_head2 = nn.Linear(config.reservoir_size, config.sqrt_vocab_size, bias=False)
+        else:
+            self.lm_head = nn.Linear(config.reservoir_size, config.vocab_size, bias=False)
+
+        self._initialize_and_freeze_weights()
+
+    def _map_targets_to_2d(self, targets_1d):
+        # targets_1d shape: (N_valid_targets)
+        # returns (targets_row, targets_col) each of shape (N_valid_targets)
+        factor = self.config.sqrt_vocab_size
+        targets_row = targets_1d // factor
+        targets_col = targets_1d % factor
+        return targets_row, targets_col
+
+    def _initialize_and_freeze_weights(self):
+        # 1. Initialize wte and input_proj (randomly, then freeze)
+        nn.init.normal_(self.wte.weight, mean=0.0, std=0.02)
+        self.wte.weight.requires_grad = False
+        
+        nn.init.uniform_(self.input_proj.weight, -self.config.input_scaling, self.config.input_scaling)
+        self.input_proj.weight.requires_grad = False
+
+        # 2. Initialize reservoir_rnn weights (W_res and its bias b_x) and freeze them
+        for name, param in self.reservoir_rnn.named_parameters():
+            if 'weight_ih' in name: # Corresponds to part of W_in projected from input_proj output
+                # These weights connect the projected input to the hidden state update.
+                # Initialize uniformly, scale might be implicitly handled by input_scaling on input_proj
+                nn.init.uniform_(param, -1.0, 1.0) 
+            elif 'weight_hh' in name: # Recurrent weights (W_res)
+                nn.init.uniform_(param.data, -1.0, 1.0)
+                W_matrix = param.data
+                # Calculate eigenvalues for square matrix
+                if W_matrix.size(0) == W_matrix.size(1):
+                    eigenvalues = torch.linalg.eigvals(W_matrix).abs()
+                    current_spectral_radius = torch.max(eigenvalues)
+                    if current_spectral_radius > 1e-9:
+                        scaling_factor = self.config.spectral_radius / current_spectral_radius
+                        param.data *= scaling_factor
+                    else:
+                         param.data *= self.config.spectral_radius # Scale to be small if SR is ~0
+            elif 'bias' in name: # b_x (reservoir bias)
+                 nn.init.uniform_(param.data, -0.1, 0.1) # Small random bias for reservoir dynamics
+            param.requires_grad = False
+        
+        # lm_head weights (lm_head1, lm_head2 or lm_head) are trainable 
+        # and will be initialized by PyTorch default (Kaiming Uniform for Linear).
+
+    def forward(self, idx, targets=None, return_logits=True, prev_state=None):
+        b, t = idx.size()
+        
+        emb = self.wte(idx) # (b, t, embed_dim)
+        # Project embeddings to the dimension expected by the RNN reservoir
+        projected_emb = self.input_proj(emb) # (b, t, reservoir_size)
+        
+        if prev_state is None:
+            # h_0 shape: (num_layers * num_directions, batch, hidden_size)
+            h_0 = torch.zeros(1, b, self.config.reservoir_size, device=idx.device, dtype=projected_emb.dtype)
+        else:
+            h_0 = prev_state # Should be (1, b, reservoir_size)
+            
+        # output_rnn: (b, t, reservoir_size) - features from all RNN time steps
+        # h_n: (1, b, reservoir_size) - final hidden state
+        output_rnn, h_n = self.reservoir_rnn(projected_emb, h_0)
+        current_state_for_next_batch = h_n 
+        
+        # Determine which states to use for the LM head
+        states_for_lm_head = output_rnn if targets is not None else output_rnn[:, [-1], :]
+        
+        loss = None
+        if self.config.use_light_rnn_output:
+            logits1 = self.lm_head1(states_for_lm_head) # (B, T_out, sqrt_V)
+            logits2 = self.lm_head2(states_for_lm_head) # (B, T_out, sqrt_V)
+            
+            if targets is not None:
+                # Flatten targets and corresponding logits for loss calculation
+                # T_out is t if targets is not None, else 1
+                T_out_actual = states_for_lm_head.size(1)
+                flat_logits1 = logits1.reshape(-1, self.config.sqrt_vocab_size) # (B*T_out, sqrt_V)
+                flat_logits2 = logits2.reshape(-1, self.config.sqrt_vocab_size) # (B*T_out, sqrt_V)
+                flat_targets = targets.reshape(-1) # (B*T_out)
+
+                # Filter out ignore_index targets (-1)
+                valid_targets_mask = (flat_targets != -1)
+                valid_flat_targets = flat_targets[valid_targets_mask]
+                
+                if valid_flat_targets.numel() > 0: # Proceed only if there are valid targets
+                    targets_row, targets_col = self._map_targets_to_2d(valid_flat_targets)
+                    
+                    # Select logits corresponding to valid targets
+                    valid_flat_logits1 = flat_logits1[valid_targets_mask]
+                    valid_flat_logits2 = flat_logits2[valid_targets_mask]
+
+                    loss1 = F.cross_entropy(valid_flat_logits1, targets_row)
+                    loss2 = F.cross_entropy(valid_flat_logits2, targets_col)
+                    loss = loss1 + loss2
+                else: # No valid targets, loss is 0 or some other appropriate value
+                    loss = torch.tensor(0.0, device=idx.device, dtype=logits1.dtype) # Ensure correct dtype and device
+            
+            # Combine logits for inference/evaluation if needed (for perplexity, generation)
+            # log P(token_rc) = log P(row_r) + log P(col_c)
+            # For full logits, we create a sqrt_V x sqrt_V grid of log_probs
+            if return_logits:
+                log_probs1 = F.log_softmax(logits1, dim=-1) # (B, T_out, sqrt_V)
+                log_probs2 = F.log_softmax(logits2, dim=-1) # (B, T_out, sqrt_V)
+                # Outer sum: (B, T_out, sqrt_V, 1) + (B, T_out, 1, sqrt_V) -> (B, T_out, sqrt_V, sqrt_V)
+                combined_log_probs = log_probs1.unsqueeze(-1) + log_probs2.unsqueeze(-2)
+                # Reshape to (B, T_out, sqrt_V*sqrt_V) and trim to vocab_size
+                logits = combined_log_probs.view(b, states_for_lm_head.size(1), -1)
+                logits = logits[:, :, :self.config.vocab_size]
+            else:
+                logits = None
+
+        else: # Standard lm_head
+            logits = self.lm_head(states_for_lm_head) # (B, T_out, vocab_size)
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        if not return_logits and loss is None : # Edge case if targets is None and return_logits is False
+             pass # logits is already None
+        elif not return_logits:
+            logits = None # Ensure logits is None if not requested
+
+        return logits, loss, current_state_for_next_batch
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        trainable_params = []
+        if self.config.use_light_rnn_output:
+            trainable_params.extend(list(self.lm_head1.parameters()))
+            trainable_params.extend(list(self.lm_head2.parameters()))
+        else:
+            trainable_params.extend(list(self.lm_head.parameters()))
+        
+        # Ensure there are trainable parameters before creating optimizer
+        if not trainable_params:
+            print0("Warning: No trainable parameters found for the ESN model.")
+            # Return a dummy optimizer or handle appropriately
+            # For now, let's allow it to proceed, Pytorch might handle empty param list gracefully for some ops.
+            # Or, more robustly:
+            # return None # Or raise an error if this state is unexpected
+            # For now, creating optimizer with empty list might error out, let's assume it's caught if no params.
+            # Actually, AdamW will error on empty list.
+            # If no trainable params, it implies an issue or a fully fixed model.
+            # In ESN, output layer *must* be trainable.
+            if master_process: # only print from master
+                print("ESN configure_optimizers: No trainable parameters specified. This is likely an error.")
+            # Fallback to a dummy parameter if list is empty to avoid crash, though this indicates a setup issue
+            if not trainable_params:
+                 dummy_param = nn.Parameter(torch.empty(0)) # Or handle error appropriately
+                 trainable_params.append(dummy_param)
+
+
+        optimizer = torch.optim.AdamW(
+            trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas
+        )
+        return optimizer
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -349,8 +531,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="d12",
-        help="d12|d24|d36|d48",
+        default="d12", # This will be ignored for ESN, but kept for now to avoid breaking arg parsing for other uses.
+        help="d12|d24|d36|d48 (ignored for ESN, ESN params are separate)",
     )
     # token layout for each step of the optimization
     parser.add_argument(
@@ -403,12 +585,6 @@ if __name__ == "__main__":
         help="how many batches of val to average?",
     )
     parser.add_argument(
-        "--val_sequence_length",
-        type=int,
-        default=1024,
-        help="sequence length used for validation (kept constant for fair metric)",
-    )
-    parser.add_argument(
         "--save_every",
         type=int,
         default=5000,
@@ -433,50 +609,18 @@ if __name__ == "__main__":
         default=3.3821,
         help="Target validation loss to stop training."
     )
-    # adaptive softmax options
     parser.add_argument(
-        "--adaptive_softmax",
-        action="store_true",
-        help="Use Adaptive Softmax output layer",
-    )
-    parser.add_argument(
-        "--asoft_cutoffs",
-        type=str,
-        default="2000,10000",
-        help="Comma-separated cutoffs for adaptive softmax",
-    )
-    parser.add_argument(
-        "--asoft_div_value",
-        type=float,
-        default=4.0,
-        help="div_value for AdaptiveLogSoftmaxWithLoss",
-    )
-    # curriculum settings
-    parser.add_argument(
-        "--curriculum_seq_lens",
-        type=str,
-        default="64,128,256",
-        help="Comma-separated list of sequence lengths to use over training",
-    )
-    parser.add_argument(
-        "--curriculum_iters",
-        type=str,
-        default="0,1000,2000",
-        help="Iterations at which to switch to the corresponding sequence length",
-    )
-    # stochastic depth
-    parser.add_argument(
-        "--stochastic_depth_prob",
-        type=float,
-        default=0.1,
-        help="Base drop probability for stochastic depth (0 disables)",
-    )
-    parser.add_argument(
-        "--stochastic_depth_anneal",
+        "--val_sequence_length",
         type=int,
-        default=2000,
-        help="Number of iterations over which drop prob linearly decays to 0",
+        default=1024,
+        help="sequence length used for validation (kept constant for fair metric)",
     )
+    # additions for ESN
+    parser.add_argument("--esn_embed_dim", type=int, default=256, help="ESN embedding dimension")
+    parser.add_argument("--esn_reservoir_size", type=int, default=2048, help="ESN reservoir size")
+    parser.add_argument("--esn_spectral_radius", type=float, default=0.99, help="ESN spectral radius")
+    parser.add_argument("--esn_input_scaling", type=float, default=0.1, help="ESN input scaling")
+    parser.add_argument("--esn_no_light_rnn_output", action="store_true", help="Disable LightRNN style output layer for ESN")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -508,8 +652,8 @@ if __name__ == "__main__":
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
         wandb.config.update(args)
-        wandb.save("train_gpt2.py")
-        wandb.save("run.sh")
+        wandb.save("train_reservoir.py")
+        wandb.save("run_reservoir.sh")
 
     tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
@@ -545,25 +689,19 @@ if __name__ == "__main__":
 
     # init the model from scratch
     num_vocab = 50257
-    cfg_kwargs_map = {
-        "d12": dict(n_layer=12, n_head=12, n_embd=768),
-        "d24": dict(n_layer=24, n_head=16, n_embd=1024),
-        "d36": dict(n_layer=36, n_head=20, n_embd=1280),
-        "d48": dict(n_layer=48, n_head=25, n_embd=1600),
-    }
-    base_kwargs = cfg_kwargs_map[args.model]
 
-    # build final GPTConfig with precision and optional extras
-    base_kwargs.update(dict(vocab_size=num_vocab, precision=args.precision))
-    # adaptive softmax extras captured later via setattr after creation
-    model_config = GPTConfig(**base_kwargs)
-
-    # attach adaptive/stochastic depth attrs
-    model_config.use_asoft = args.adaptive_softmax
-    if args.adaptive_softmax:
-        model_config.asoft_cutoffs = [int(c.strip()) for c in args.asoft_cutoffs.split(',') if c.strip()]
-        model_config.asoft_div_value = args.asoft_div_value
-    model_config.stochastic_depth_prob = args.stochastic_depth_prob
+    # --- ESN Model Configuration ---
+    esn_config = ESNConfig(
+        vocab_size=num_vocab,
+        embed_dim=args.esn_embed_dim,
+        reservoir_size=args.esn_reservoir_size,
+        spectral_radius=args.esn_spectral_radius,
+        input_scaling=args.esn_input_scaling,
+        precision=args.precision,
+        use_light_rnn_output=not args.esn_no_light_rnn_output
+    )
+    print0(f"Using ESN configuration: {esn_config}")
+    # --- End ESN Model Configuration ---
 
     # decide parameter / activation dtype
     dtype = (
@@ -575,19 +713,20 @@ if __name__ == "__main__":
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    model = GPT(model_config).to(device, dtype=dtype)
-    if model_config.use_asoft and dtype != torch.float32:
-        # keep adaptive softmax weights in fp32 for matmul accuracy
-        model.asoft.to(torch.float32)
+    # model = GPT(model_config).to(device, dtype=dtype) # Old GPT model
+    model = ESN(esn_config).to(device, dtype=dtype) # New ESN model
+
     model = model.train().cuda()
-    if hasattr(config, "coordinate_descent_tuning"):
+    if config is not None and hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
-    print0("compiling the model...")
-    # torch.compile can recompile if we change block drop_prob each step; disable for stability
-    # model = torch.compile(model)
+    print0("compiling the model (torch.compile)...")
+    try:
+        model = torch.compile(model)
+    except Exception as compile_err:
+        print0(f"torch.compile failed or not supported: {compile_err}. Proceeding without compilation.")
 
     # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module  # always contains the "raw" unwrapped model
 
     # init the optimizer
@@ -628,11 +767,9 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # curriculum helpers
-    curriculum_lens = [int(s) for s in args.curriculum_seq_lens.split(',') if s.strip()]
-    curriculum_iters = [int(s) for s in args.curriculum_iters.split(',') if s.strip()]
-    assert len(curriculum_lens) == len(curriculum_iters), "curriculum seq lens and iters mismatch"
-    step_idx_ptr = 0
+    # If warmdown_iters not provided (0), default to one quarter of total iterations
+    if args.warmdown_iters == 0:
+        args.warmdown_iters = max(args.num_iterations // 4, 1)
 
     # begin training
     for step in range(args.num_iterations + 1):
@@ -649,7 +786,7 @@ if __name__ == "__main__":
                 val_loss = 0.0
                 for _ in range(val_steps):  # always fiexed number of validation steps
                     x_val, y_val = val_loader.next_batch()
-                    _, loss = model(x_val, y_val, return_logits=False)
+                    _, loss, _ = model(x_val, y_val, return_logits=False, prev_state=None) # ESN forward
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
@@ -681,26 +818,25 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
-        train_loss = torch.zeros(1, device=device)
+        raw_loss = 0.0
         for micro_step in range(args.grad_accumulation_steps):
             model.require_backward_grad_sync = (
                 micro_step == args.grad_accumulation_steps - 1
             )  # sync only on last micro step to avoid overhead
             # forward pass
             with ctx:
-                _, loss = model(x, y, return_logits=False)
-                loss = (
-                    loss / args.grad_accumulation_steps
-                )  # scale loss for gradient accumulation
-                train_loss += loss.detach()
+                _, ce_loss, _ = model(x, y, return_logits=False, prev_state=None)  # ESN forward
+                raw_loss += ce_loss.detach()  # accumulate the *real* loss for logging
+                loss = ce_loss / args.grad_accumulation_steps  # scaled for grad-accum
             # advance the dataset for the next batch
             x, y = train_loader.next_batch()
             # backward pass
             loss.backward()
 
-        train_loss /= (
-            args.grad_accumulation_steps
-        )  # average the loss over all micro steps
+        # clip before the optimizer step to avoid exploding updates
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=1.0)
+
+        train_loss = raw_loss / args.grad_accumulation_steps  # mean over micro-steps
 
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
@@ -731,22 +867,6 @@ if __name__ == "__main__":
             log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
             os.makedirs("logs/%s" % run_id, exist_ok=True)
             torch.save(log, "logs/%s/model_step%06d.pt" % (run_id, step))
-
-        # update curriculum sequence length if schedule dictates
-        if step_idx_ptr < len(curriculum_iters) and step == curriculum_iters[step_idx_ptr]:
-            new_T = curriculum_lens[step_idx_ptr]
-            if new_T != T:
-                T = new_T
-                train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-                tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
-                print0(f"[curriculum] switched sequence length to {T} at step {step}")
-            step_idx_ptr += 1
-
-        # anneal stochastic depth
-        if args.stochastic_depth_prob > 0.0 and args.stochastic_depth_anneal > 0:
-            cur_drop = args.stochastic_depth_prob * max(0.0, (args.stochastic_depth_anneal - step) / args.stochastic_depth_anneal)
-            for blk in raw_model.transformer.h:
-                blk.drop_prob = cur_drop
 
     print0(
         f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"

@@ -12,9 +12,18 @@ import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import nn
 from torch.nn import AdaptiveLogSoftmaxWithLoss
-torch.set_float32_matmul_precision('high')
 # For BF16 performance
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+# Set TF32 precision for matmul for better performance on Ampere GPUs
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # choose fastest algorithm
+# enable efficient FFT plan cache for AFNO layers
+if hasattr(torch.backends.cuda, "enable_mem_efficient_fft"):
+    torch.backends.cuda.enable_mem_efficient_fft(True)
+if hasattr(torch.backends.cuda, "enable_fft_planning_cache"):
+    torch.backends.cuda.enable_fft_planning_cache(True)
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
