@@ -16,11 +16,6 @@ torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True  # choose fastest algorithm
-# enable efficient FFT plan cache for AFNO layers
-if hasattr(torch.backends.cuda, "enable_mem_efficient_fft"):
-    torch.backends.cuda.enable_mem_efficient_fft(True)
-if hasattr(torch.backends.cuda, "enable_fft_planning_cache"):
-    torch.backends.cuda.enable_fft_planning_cache(True)
 from torch import nn
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 import torch.distributed as dist
@@ -29,12 +24,41 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from afno import AFNO1D # Import AFNO1D
+# Import optimizers
 from tensorgrad import TensorGRaD
-from afno_seq import AFNO1DSeq
+
+# Optional Lion optimizer (install with `pip install lion-pytorch`)
+try:
+    from lion_pytorch import Lion
+    LION_AVAILABLE = True
+except ImportError:
+    LION_AVAILABLE = False
+
+# For memory-saving checkpointing
+import torch.utils.checkpoint as ckpt
 
 with open(sys.argv[0]) as f:
     code = f.read()
+
+# -----------------------------------------------------------------------------
+# Mamba SSM implementation
+
+try:
+    from mamba_ssm import Mamba
+    MAMBA_AVAILABLE = True
+except ImportError:
+    print("Warning: mamba_ssm not available. Install with: pip install mamba-ssm")
+    MAMBA_AVAILABLE = False
+    
+    # Fallback implementation for testing
+    class Mamba(nn.Module):
+        def __init__(self, d_model, d_state=16, d_conv=4, expand=2, **kwargs):
+            super().__init__()
+            self.d_model = d_model
+            self.linear = nn.Linear(d_model, d_model)
+            
+        def forward(self, x):
+            return self.linear(x)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -114,47 +138,61 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class MambaBlock(nn.Module):
+    """Mamba SSM block for sequence modeling"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.mamba = Mamba(
+            d_model=config.n_embd,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
+        )
+
+    def forward(self, x):
+        # Mamba handles causality natively
+        return self.mamba(x)
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.use_checkpoint = getattr(config, "use_checkpoint", False)
 
-    def forward(self, x):
+    def _forward_impl(self, x):
         x = self.c_fc(x)
         x = F.gelu(x)
+        x = self.dropout(x)
         x = self.c_proj(x)
         return x
+
+    def forward(self, x):
+        if self.use_checkpoint and self.training:
+            return ckpt.checkpoint(self._forward_impl, x, use_reentrant=False)
+        else:
+            return self._forward_impl(x)
 
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if config.mixer == "afno" or config.mixer == "afno_c":
-            self.mixer = AFNO1D(
-                hidden_size=config.n_embd, 
-                num_blocks=config.afno_num_blocks, 
-                sparsity_threshold=config.afno_sparsity_threshold,
-                hard_thresholding_fraction=config.afno_hard_thresholding_fraction,
-                hidden_size_factor=config.afno_hidden_size_factor
-            )
-        elif config.mixer == "afno_seq":
-            self.mixer = AFNO1DSeq(
-                hidden_size=config.n_embd,
-                num_blocks=config.afno_num_blocks,
-                sparsity_threshold=config.afno_sparsity_threshold,
-                hard_thresholding_fraction=config.afno_hard_thresholding_fraction,
-                hidden_size_factor=config.afno_hidden_size_factor,
-            )
+        if config.mixer == "mamba":
+            self.mixer = MambaBlock(config)
         elif config.mixer == "attn":
             self.mixer = CausalSelfAttention(config)
         else:
             raise ValueError(f"Unknown mixer type: {config.mixer}")
         
         self.mlp = MLP(config)
-        self.mixer_scale = 1 / math.sqrt(2 * config.n_layer) # Renamed from attn_scale for generality
+        self.mixer_scale = 1 / math.sqrt(2 * config.n_layer)
+        self.dropout = nn.Dropout(config.dropout)
+        self.use_checkpoint = getattr(config, "use_checkpoint", False)
 
     def forward(self, x):
         x = x + self.mixer_scale * self.mixer(rmsnorm(x)) 
@@ -172,18 +210,15 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    bias: bool = False # Added bias flag, False by default as in original code
-    mixer: str = "attn"  # Can be "attn" or "afno"
-    afno_num_blocks: int = 8
-    afno_sparsity_threshold: float = 0.01
-    afno_hard_thresholding_fraction: float = 1.0
-    afno_hidden_size_factor: int = 1 # Added based on AFNO1D __init__
-    # seq_len needed for absolute positional embeddings if not using RoPE
-    # Using a default that matches common GPT-2, can be overridden
-    # Ensure this is passed or set appropriately when using AFNO
-    sequence_length: int = 1024 
-    # dropout: float = 0.0 # Not directly used in Block/Attention in this baseline, but good to have
-    # seq_len: int = 1024 # Or context_length, useful for pos_emb if not RoPE
+    bias: bool = False
+    mixer: str = "mamba"  # "mamba" or "attn"
+    sequence_length: int = 2048
+    # Mamba-specific parameters
+    mamba_d_state: int = 16      # SSM state expansion factor
+    mamba_d_conv: int = 4        # Local convolution width  
+    mamba_expand: int = 2        # Block expansion factor
+    dropout: float = 0.0         # Dropout probability
+    use_checkpoint: bool = False # Enable gradient checkpointing per Block
 
 
 class GPT(nn.Module):
@@ -196,9 +231,6 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         )
-        # Add wpe only if not using attention (which uses RoPE internally)
-        if self.config.mixer == "afno":
-            modules['wpe'] = nn.Embedding(config.sequence_length, config.n_embd)
         
         self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
@@ -208,22 +240,12 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
-        # pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t) # Not used if wpe is added or RoPE is used
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         
-        if self.config.mixer == "afno":
-            # For AFNO, add absolute positional embeddings
-            # Ensure sequence_length in config is appropriate for the task
-            assert t <= self.config.sequence_length, \
-                f"Sequence length {t} exceeds model configured sequence_length {self.config.sequence_length}"
-            pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
-            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-            x = tok_emb + pos_emb
-        else:
-            # For attention (RoPE), no explicit addition of wpe here as RoPE handles pos info in CausalSelfAttention
-            x = tok_emb
+        # For Mamba, no explicit positional embeddings - handled through state
+        x = tok_emb
 
         for block in self.transformer.h:
             x = block(x)
@@ -254,28 +276,47 @@ class GPT(nn.Module):
         learning_rate,
         betas,
         device_type,
-        rank,
-        sparsity,
-        lambda_sparse,
-        update_freq,
+        optimizer_type="adamw",
+        # TensorGRaD specific params
+        rank=4,
+        sparsity=0.01,
+        lambda_sparse=1.0,
+        update_freq=1,
     ):
-        """Instantiate a *TensorGRaD* optimiser.
-
-        Additional keyword arguments are forwarded directly to the
-        :class:`tensorgrad.TensorGRaD` constructor so that command-line flags
-        can control rank, sparsity, etc.
-        """
-
-        optimizer = TensorGRaD(
-            self.parameters(),
-            lr=learning_rate,
-            betas=betas,
-            weight_decay=weight_decay,
-            rank=rank,
-            sparsity=sparsity,
-            lambda_sparse=lambda_sparse,
-            update_freq=update_freq,
-        )
+        """Configure optimizer based on type"""
+        
+        if optimizer_type == "tensorgrad":
+            optimizer = TensorGRaD(
+                self.parameters(),
+                lr=learning_rate,
+                betas=betas,
+                weight_decay=weight_decay,
+                rank=rank,
+                sparsity=sparsity,
+                lambda_sparse=lambda_sparse,
+                update_freq=update_freq,
+            )
+        elif optimizer_type == "adamw":
+            # Standard fused AdamW
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=learning_rate,
+                betas=betas,
+                weight_decay=weight_decay,
+                fused=True if device_type == "cuda" else False,
+            )
+        elif optimizer_type == "lion":
+            if not LION_AVAILABLE:
+                raise ImportError("lion-pytorch not installed. install with `pip install lion-pytorch`")
+            optimizer = Lion(
+                self.parameters(),
+                lr=learning_rate,
+                betas=betas,
+                weight_decay=weight_decay,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+            
         return optimizer
 
 
@@ -385,6 +426,7 @@ if __name__ == "__main__":
     import argparse
 
     print0(f"Running pytorch {torch.version.__version__}")
+    print0(f"Mamba SSM available: {MAMBA_AVAILABLE}")
 
     parser = argparse.ArgumentParser()
     # file system input / output
@@ -416,46 +458,56 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
+        default=8,
         help="batch size, in units of #batch dimensions",
     )
     parser.add_argument(
         "--grad_accumulation_steps",
         type=int,
-        default=1,
+        default=64,
         help="number of gradient accumulation steps",
     )
     parser.add_argument(
-        "--sequence_length", type=int, default=1024, help="sequence length for the model and positional embeddings"
+        "--sequence_length", type=int, default=2048, help="sequence length for the model"
     )
     # workload (number of steps)
     parser.add_argument(
-        "--num_iterations", type=int, default=10, help="number of iterations to run"
+        "--num_iterations", type=int, default=3000, help="number of iterations to run"
     )
     # optimization
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
-        help="learning rate warmup iterations",
+        default=3e-4,
+        help="learning rate",
     )
     parser.add_argument(
-        "--warmup_iters", type=int, default=0, help="learning rate warmup iterations"
+        "--warmup_iters", type=int, default=256, help="learning rate warmup iterations"
     )
     parser.add_argument(
         "--warmdown_iters",
         type=int,
-        default=0,
+        default=1024,
         help="learning rate warmdown iterations",
     )
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="weight decay")
     parser.add_argument("--bias", action="store_true", help="Enable bias in Linear layers")
+    
+    # Optimizer selection
+    parser.add_argument(
+        "--optimizer", 
+        type=str, 
+        default="adamw", 
+        choices=["adamw", "tensorgrad", "lion"],
+        help="Optimizer type: adamw (fused), tensorgrad, or lion"
+    )
+    
     # evaluation
     parser.add_argument(
         "--val_loss_every",
         type=int,
-        default=0,
-        help="every how mant steps to evaluate val loss?",
+        default=128,
+        help="every how many steps to evaluate val loss?",
     )
     parser.add_argument(
         "--val_batch_size",
@@ -474,24 +526,49 @@ if __name__ == "__main__":
         action="store_true",
         help="log to wandb",
     )
-    # AFNO specific arguments
-    parser.add_argument("--mixer", type=str, default="afno_seq", choices=["attn", "afno", "afno_seq"], help="Type of mixer to use: attn, afno (channel-FFT), afno_seq (sequence-FFT)")
-    parser.add_argument("--afno_num_blocks", type=int, default=8, help="Number of blocks for AFNO1D")
-    parser.add_argument("--afno_sparsity_threshold", type=float, default=0.01, help="Sparsity threshold for AFNO1D")
-    parser.add_argument("--afno_hard_thresholding_fraction", type=float, default=1.0, help="Hard thresholding fraction for AFNO1D")
-    parser.add_argument("--afno_hidden_size_factor", type=int, default=1, help="Hidden size factor for AFNO1D MLP")
+    parser.add_argument(
+        "--target_val_loss",
+        type=float,
+        default=3.3821,
+        help="Target validation loss to stop training."
+    )
+    
+    # Mamba specific arguments
+    parser.add_argument("--mixer", type=str, default="mamba", choices=["mamba", "attn"], help="Type of mixer to use: mamba or attn")
+    parser.add_argument("--mamba_d_state", type=int, default=16, help="Mamba SSM state expansion factor")
+    parser.add_argument("--mamba_d_conv", type=int, default=4, help="Mamba local convolution width")
+    parser.add_argument("--mamba_expand", type=int, default=2, help="Mamba block expansion factor")
 
-    # TensorGRaD specific arguments
+    # TensorGRaD specific arguments (only used if --optimizer tensorgrad)
     parser.add_argument("--tg_rank", type=int, default=4, help="Rank for low-rank approximation in TensorGRaD")
-    parser.add_argument("--tg_sparsity", type=float, default=0.01, help="Fraction of gradient elements kept in sparse component")
+    parser.add_argument("--tg_sparsity", type=float, default=0.02, help="Fraction of gradient elements kept in sparse component")
     parser.add_argument("--tg_lambda", type=float, default=1.0, help="Scaling factor for sparse update in TensorGRaD")
-    parser.add_argument("--tg_update_freq", type=int, default=1, help="Frequency (in steps) for refreshing sparse indices")
+    parser.add_argument("--tg_update_freq", type=int, default=4, help="Frequency (in steps) for refreshing sparse indices")
+
+    # Optimizer hyperparams
+    parser.add_argument("--beta1", type=float, default=0.9, help="optimizer beta1")
+    parser.add_argument("--beta2", type=float, default=0.99, help="optimizer beta2")
+
+    # Dropout hyperparam
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability in MLP layers")
+
+    # LR schedule options
+    parser.add_argument("--lr_schedule", type=str, default="linear", choices=["linear", "cosine"], help="Learning rate schedule: linear or cosine")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Min LR ratio relative to peak when using cosine schedule")
+
+    # Memory checkpoint flag
+    parser.add_argument("--use_checkpoint", action="store_true", help="Enable gradient checkpointing (saves memory, extra compute)")
 
     args = parser.parse_args()
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert args.model in {"d12", "d24", "d36", "d48"}
+    
+    if args.mixer == "mamba" and not MAMBA_AVAILABLE:
+        print("ERROR: Mamba not available. Install with: pip install mamba-ssm")
+        exit(1)
+    
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
@@ -516,10 +593,8 @@ if __name__ == "__main__":
         import datetime
 
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
+        wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time} mamba-{args.optimizer}")
         wandb.config.update(args)
-        wandb.save("train_gpt2.py")
-        wandb.save("run.sh")
 
     tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
@@ -545,11 +620,12 @@ if __name__ == "__main__":
         "vocab_size": num_vocab,
         "bias": args.bias,
         "mixer": args.mixer,
-        "afno_num_blocks": args.afno_num_blocks,
-        "afno_sparsity_threshold": args.afno_sparsity_threshold,
-        "afno_hard_thresholding_fraction": args.afno_hard_thresholding_fraction,
-        "afno_hidden_size_factor": args.afno_hidden_size_factor,
-        "sequence_length": args.sequence_length
+        "mamba_d_state": args.mamba_d_state,
+        "mamba_d_conv": args.mamba_d_conv,
+        "mamba_expand": args.mamba_expand,
+        "sequence_length": args.sequence_length,
+        "dropout": args.dropout,
+        "use_checkpoint": args.use_checkpoint
     }
     model_size_configs = {
         "d12": dict(n_layer=12, n_head=12, n_embd=768),
@@ -565,10 +641,10 @@ if __name__ == "__main__":
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     print0("compiling the model...")
-    # model = torch.compile(
-    #     model,
-    #     # options={"triton.cudagraphs": False}
-    # )  # NOTE: this might cause issues depending on your GPU, consider turning it off
+    model = torch.compile(
+        model,
+        # options={"triton.cudagraphs": False}
+    )  # NOTE: this might cause issues depending on your GPU, consider turning it off
 
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -578,27 +654,44 @@ if __name__ == "__main__":
     optimizer = raw_model.configure_optimizers(
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
+        betas=(args.beta1, args.beta2),
         device_type=device,
+        optimizer_type=args.optimizer,
         rank=args.tg_rank,
         sparsity=args.tg_sparsity,
         lambda_sparse=args.tg_lambda,
         update_freq=args.tg_update_freq,
     )
 
-    # learning rate decay scheduler (linear warmup and warmdown)
-    def get_lr(it):
-        assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
+    print0(f"Using optimizer: {args.optimizer}")
+
+    # learning-rate scheduler helper
+    min_lr = args.learning_rate * args.min_lr_ratio
+
+    def lr_linear(it):
+        effective_max_iter = original_num_iterations
         if it < args.warmup_iters:
             return args.learning_rate * (it + 1) / args.warmup_iters
-        # 2) constant lr for a while
-        elif it < args.num_iterations - args.warmdown_iters:
+        elif it < effective_max_iter - args.warmdown_iters:
             return args.learning_rate
-        # 3) linear warmdown
-        else:
-            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        elif it < effective_max_iter:
+            decay_ratio = (effective_max_iter - it) / args.warmdown_iters
             return args.learning_rate * decay_ratio
+        else:
+            return min_lr
+
+    def lr_cosine(it):
+        effective_max_iter = original_num_iterations
+        if it < args.warmup_iters:
+            return args.learning_rate * (it + 1) / args.warmup_iters
+        elif it >= effective_max_iter:
+            return min_lr
+        else:
+            progress = (it - args.warmup_iters) / max(1, effective_max_iter - args.warmup_iters)
+            cosine = 0.5 * (1 + math.cos(math.pi * progress))
+            return min_lr + (args.learning_rate - min_lr) * cosine
+
+    get_lr = lr_cosine if args.lr_schedule == "cosine" else lr_linear
 
     run_id = str(uuid.uuid4())
 
@@ -616,6 +709,11 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    # Extension mechanism for target validation loss
+    extension_count = 0
+    max_extensions = 10
+    original_num_iterations = args.num_iterations
+
     # begin training
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
@@ -629,7 +727,7 @@ if __name__ == "__main__":
             val_loader.reset()  # reset the val loader so that it starts from the beginning
             with torch.no_grad():
                 val_loss = 0.0
-                for _ in range(val_steps):  # always fiexed number of validation steps
+                for _ in range(val_steps):  # always fixed number of validation steps
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
@@ -637,6 +735,12 @@ if __name__ == "__main__":
                 val_loss /= val_steps
             # log to console and to file
             print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
+            
+            # Check for early stopping based on target validation loss
+            if val_loss.item() <= args.target_val_loss:
+                print0(f"Target validation loss {args.target_val_loss} reached at step {step}. Stopping training after {training_time_ms/1000:.2f} seconds ({training_time_ms/3600000:.2f} hours).")
+                last_step = True # This will break the main loop after this block
+            
             if master_process:
                 if args.log_wandb:
                     wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)
@@ -649,12 +753,23 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-        # bit confusing: we want to make sure to eval on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
+        # Check if we've reached the end of planned iterations without hitting target
         if last_step:
-            break
+            # If we reached num_iterations without hitting target, try extensions
+            if step >= args.num_iterations and extension_count < max_extensions:
+                # Check if we should extend training
+                if 'val_loss' in locals() and val_loss.item() > args.target_val_loss:
+                    extension_count += 1
+                    args.num_iterations += args.val_loss_every
+                    print0(f"Extension {extension_count}/{max_extensions}: Target not reached, extending by {args.val_loss_every} steps to {args.num_iterations}")
+                    last_step = False  # Continue training
+                else:
+                    break  # Target reached or no more extensions
+            else:
+                # Check if we exhausted all extensions without reaching target
+                if extension_count >= max_extensions and 'val_loss' in locals() and val_loss.item() > args.target_val_loss:
+                    print0(f"❌ TRAINING FAILED: Could not reach target validation loss {args.target_val_loss} after {max_extensions} extensions. Final loss: {val_loss.item():.6f}")
+                break
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
@@ -699,7 +814,7 @@ if __name__ == "__main__":
         print0(
             f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
         )
-        # log to logile
+        # log to logfile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
                 f.write("s:%d trn:%f\n" % (step, lossf))

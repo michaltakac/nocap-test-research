@@ -1,11 +1,11 @@
 torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim_afno_tensorgrad.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
-  --output_dir pylog124M_afno \
+  --output_dir pylog124M_afno_seq \
   --model d12 \
-  --batch_size 8 \
-  --grad_accumulation_steps 64 \
-  --sequence_length 2048 \
+  --batch_size 4 \
+  --grad_accumulation_steps 128 \
+  --sequence_length 256 \
   --val_loss_every 128 \
   --val_batch_size 4 \
   --num_iterations 3000 \
@@ -22,5 +22,5 @@ torchrun --standalone --nproc_per_node=1 train_gpt2_rtx4090_optim_afno_tensorgra
   --tg_sparsity 0.02 \
   --tg_lambda 1.0 \
   --tg_update_freq 4 \
-  --log_wandb
+  #--log_wandb
   # --bias # Optional: uncomment to enable bias in linear layers

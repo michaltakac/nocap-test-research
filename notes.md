@@ -162,3 +162,50 @@ These items do **not** duplicate the already-tested methods and present a realis
 
 
 **Bonus (zamerané na inferenciu): Diffusion-based generation** - implementovať non-autoregressive model s generovaním tokenov difúziou (nedávno demované Googlom), vysoká rýchlosť inferencie (nie až tak zaujímavé pre tréning)
+
+---
+
+## Notes 2025-06-09
+
+### Mamba State Space Model Implementation
+
+After researching latest advances in sequence modeling that could solve AFNO's causality issues while maintaining long-range dependencies, implemented **Mamba SSM** as a replacement for traditional attention mechanisms.
+
+**Key Findings:**
+- Mamba emerged as the leading solution in 2024 for causal sequence modeling without breaking long-range dependencies
+- Achieves O(T) complexity vs O(T²) for attention, allowing much longer sequences
+- Native causality handling eliminates the complexity issues found in sequence-wise AFNO
+
+**Implementation Details:**
+- Created `train_gpt2_mamba.py` with dual optimizer support (AdamW + TensorGRaD)
+- Supports both Mamba and attention mixers via `--mixer` flag
+- Extended sequence length to 2048 tokens (8x longer than AFNO experiments)
+- Implemented early stopping with `--target_val_loss` and 10x extension mechanism
+
+**Training Results (Initial Run):**
+- **Excellent early convergence**: Val loss dropped from 10.95 → 3.38 in ~1000 steps
+- **Fast learning**: Target nearly reached much earlier than planned 3000 iterations
+- **Proved concept**: Mamba successfully learns long-range dependencies without causality issues
+
+**Validation Loss Plateau Issue (June 9):**
+- Training showed severe overfitting: train loss 0.067 vs val loss 4.30 (64x gap)
+- Val loss plateaued around 4.3, still 0.92 points from target 3.3821
+- Extension mechanism triggered correctly but fundamental convergence issue identified
+
+**Hyperparameter Adjustments Applied:**
+1. **Increased regularization**: Weight decay `0.1` → `0.2` (100% increase)
+2. **Reduced learning rate**: `3e-4` → `1.5e-4` (50% reduction) 
+3. **Larger validation batches**: `4/8` → `16` (2-4x increase for stability)
+
+**Files Updated:**
+- `run_mamba_adamw.sh`
+- `run_mamba_adamw_optimized.sh` 
+- `run_mamba_tensorgrad.sh`
+
+**Expected Impact:**
+- Better train/val generalization gap through stronger regularization
+- Smoother convergence past 4.3 plateau with lower learning rate
+- More stable validation metrics with larger batch sizes
+
+**Next Steps:**
+Re-run training with updated hyperparameters to test if validation loss can break through the 4.3 plateau and reach the 3.3821 target.
